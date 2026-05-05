@@ -97,7 +97,7 @@ bash build.sh
 
 需要 macOS 14+ 及 Xcode 15+。
 
-## 多台电脑部署
+## 配置说明
 
 1. 将 `MergeSASE.app` 拷贝到目标电脑
 2. 在 App 中修改公司域名为实际域名
