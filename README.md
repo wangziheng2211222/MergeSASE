@@ -1,9 +1,5 @@
 # MergeSASE — Clash + SASE VPN 共存方案
 
-让 Clash 代理和公司 SASE VPN 同时开启，互不冲突。外网走代理，内网走 VPN。
-
-> SASE 总把代理关掉，用守护锁住。Clash 把公司域名解析成假 IP，用规则排除。TUN 把内网流量也劫了，用路由放行。Chrome 不认代理规则，用命令行参数强制。四步下来，外走 Clash，内走 SASE。
-
 ## 快速开始
 
 ### 方式一：MergeSASE.app（推荐）
