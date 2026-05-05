@@ -120,7 +120,3 @@ route -n get <公司内网IP>
 # 重置
 bash clash-sase-fix.command
 ```
-
-## License
-
-MIT
