@@ -1,4 +1,4 @@
-# MergeSASE — Clash + SASE VPN 共存方案
+# MergeSASE
 
 ## 快速开始
 
