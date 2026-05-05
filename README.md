@@ -97,13 +97,6 @@ bash build.sh
 
 需要 macOS 14+ 及 Xcode 15+。
 
-## 配置说明
-
-1. 将 `MergeSASE.app` 拷贝到目标电脑
-2. 在 App 中修改公司域名为实际域名
-3. 在 Clash Verge 的「配置增强」中导入 `Merge.yaml`
-4. 点击「一键启动」
-
 ## 排查问题
 
 详见 App 内日志面板，或命令行诊断：
