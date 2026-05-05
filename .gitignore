@@ -1,0 +1,22 @@
+.DS_Store
+.build/
+*.app
+图标.png
+
+# macOS
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# IDE
+.idea/
+.vscode/
+*.xcodeproj/
+*.xcworkspace/
+
+# Sensitive
+*.pem
+*.key
+*.p12
+*.mobileprovision

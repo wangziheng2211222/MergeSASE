@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>ProxySettings</key>
+    <dict>
+        <key>ProxyMode</key>
+        <string>fixed_servers</string>
+        <key>ProxyServer</key>
+        <string>http://127.0.0.1:7897</string>
+        <key>ProxyBypassList</key>
+        <string>*.company.internal;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16;127.0.0.1;localhost;*.local</string>
+    </dict>
+    <key>DnsOverHttpsMode</key>
+    <string>off</string>
+</dict>
+</plist>

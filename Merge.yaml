@@ -1,0 +1,22 @@
+# MergeSASE — Clash Verge Profile Enhancement Merge Template
+profile:
+  store-selected: true
+
+dns:
+  use-system-hosts: false
+  fake-ip-filter:
+    - '+.company.internal'
+
+tun:
+  enable: true
+  stack: system
+  route-exclude-address:
+    - '10.0.0.0/8'
+    - '172.16.0.0/12'
+    - '192.168.0.0/16'
+    - '10.0.0.0/8'
+  route-exclude:
+    - '10.0.0.0/8'
+    - '172.16.0.0/12'
+    - '192.168.0.0/16'
+    - '10.0.0.0/8'
