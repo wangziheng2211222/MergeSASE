@@ -1,5 +1,5 @@
 **遇到损坏无法打开，终端执行**
-xattr -cr /path/to/（把app直接拖到终端里）
+xattr -cr（把app直接拖到终端里）
 然后系统设置隐私安全那边通过一下
 
 # MergeSASE
