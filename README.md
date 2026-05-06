@@ -1,3 +1,6 @@
+
+[MergeSASE.zip](https://github.com/user-attachments/files/27425119/MergeSASE.zip)
+
 **遇到损坏无法打开，终端执行**
 xattr -cr（把app直接拖到终端里）
 就可以打开了。
