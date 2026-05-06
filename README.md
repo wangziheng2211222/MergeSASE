@@ -1,6 +1,7 @@
 
-[MergeSASE.zip](https://github.com/user-attachments/files/27447094/MergeSASE.zip) v1.1
+[MergeSASE.zip](https://github.com/user-attachments/files/27447094/MergeSASE.zip) 
 
+最新更新v1.1：修复claudecode无法走公司内网的问题。
 
 **遇到损坏无法打开，终端执行**
 xattr -cr（把app直接拖到终端里）
