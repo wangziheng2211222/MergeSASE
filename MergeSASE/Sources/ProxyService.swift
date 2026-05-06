@@ -42,8 +42,14 @@ final class ProxyService {
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
 
     init() {
-        self.companyDomains = UserDefaults.standard.stringArray(forKey: "companyDomains") ?? ["company.internal"]
-        if companyDomains.isEmpty { companyDomains = ["company.internal"] }
+        let saved = UserDefaults.standard.stringArray(forKey: "companyDomains") ?? []
+        // Migrate from old default or bootstrap
+        if saved.isEmpty || saved == ["company.internal"] {
+            self.companyDomains = ["cds8.cn", "limayao.com"]
+            UserDefaults.standard.removeObject(forKey: "companyDomains") // let didSet write fresh value
+        } else {
+            self.companyDomains = saved
+        }
         Task { await refreshStatus() }
     }
 
@@ -60,7 +66,7 @@ final class ProxyService {
 
     func removeDomain(_ domain: String) {
         companyDomains.removeAll { $0 == domain }
-        if companyDomains.isEmpty { companyDomains = ["company.internal"] }
+        if companyDomains.isEmpty { companyDomains = ["cds8.cn", "limayao.com"] }
     }
 
     // MARK: - Port Detection
@@ -234,10 +240,29 @@ final class ProxyService {
         // Write Clash merge config with route-exclude
         await writeMergeConfig(port: port)
 
-        // Generate guard script
+        // Generate guard script — include resolved IP ranges
         let guardDir = "\(homeDir)/.local/bin"
         let guardScript = "\(guardDir)/clash-proxy-guard.sh"
         try? FileManager.default.createDirectory(atPath: guardDir, withIntermediateDirectories: true, attributes: nil)
+        var guardBypassItems = ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
+                                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"]
+        for domain in companyDomains {
+            guardBypassItems.append(domain)
+            guardBypassItems.append("*.\(domain)")
+            let digRes = await CommandRunner.runShell("dig +short \(domain) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
+            let ip = digRes.stdout.trimmingCharacters(in: .whitespaces)
+            if !ip.isEmpty {
+                let parts = ip.components(separatedBy: ".")
+                if parts.count == 4 {
+                    guardBypassItems.append("\(parts[0]).\(parts[1]).0.0/16")
+                }
+            }
+        }
+        // Deduplicate
+        var seenGuard = Set<String>()
+        guardBypassItems = guardBypassItems.filter { seenGuard.insert($0).inserted }
+
+        let guardBypassStr = guardBypassItems.map { "\"\($0)\"" }.joined(separator: " ")
         let domainLines = companyDomains.map { "    \"\($0)\"" }.joined(separator: "\n")
         let guardContent = """
         #!/bin/bash
@@ -246,17 +271,15 @@ final class ProxyService {
         COMPANY_DOMAINS=(
         \(domainLines)
         )
-        current_host=$(scutil --proxy 2>/dev/null | grep HTTPProxy | awk '{print $3}')
-        if [ "$current_host" = "$CLASH_HOST" ]; then
-            exit 0
-        fi
-        BYPASS=("127.0.0.1" "localhost" "*.local" "169.254.0.0/16" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "${COMPANY_DOMAINS[@]}")
-        for service in $(networksetup -listallnetworkservices 2>/dev/null | tail -n +2); do
+        BYPASS=(\(guardBypassStr))
+        while IFS= read -r service; do
+            [ -z "$service" ] && continue
+            case "$service" in \\**) continue ;; esac
             networksetup -setwebproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null || true
             networksetup -setsecurewebproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null || true
             networksetup -setsocksfirewallproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null || true
             networksetup -setproxybypassdomains "$service" "${BYPASS[@]}" 2>/dev/null || true
-        done
+        done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
         """
         do {
             try guardContent.write(toFile: guardScript, atomically: true, encoding: .utf8)
@@ -294,9 +317,24 @@ final class ProxyService {
             phase = .error; statusMessage = "launchd 配置写入失败"; return
         }
 
-        // Set system proxy
-        let bypassList = ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
-                          "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] + companyDomains
+        // Set system proxy — include resolved IP ranges in bypass
+        var bypassList = ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
+                          "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"]
+        for domain in companyDomains {
+            bypassList.append(domain)
+            bypassList.append("*.\(domain)")
+            let digRes = await CommandRunner.runShell("dig +short \(domain) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
+            let ip = digRes.stdout.trimmingCharacters(in: .whitespaces)
+            if !ip.isEmpty {
+                let parts = ip.components(separatedBy: ".")
+                if parts.count == 4 {
+                    bypassList.append("\(parts[0]).\(parts[1]).0.0/16")
+                }
+            }
+        }
+        // Deduplicate while preserving order
+        var seen = Set<String>()
+        bypassList = bypassList.filter { seen.insert($0).inserted }
         let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
         let services = svcResult.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
         for service in services {
@@ -310,7 +348,8 @@ final class ProxyService {
         log("系统代理已设置: \(proxyHost):\(port)", .success)
 
         // Write Chrome Managed Policy (forces proxy + bypass for all users)
-        let bypassStr = "*.\(companyDomains.joined(separator: ";*."));10.0.0.0/8;172.16.0.0/12;192.168.0.0/16;127.0.0.1;localhost;*.local"
+        let chromeBypassItems: [String] = companyDomains.map { "*.\($0)" } + bypassList.filter { $0.contains("/") || $0 == "127.0.0.1" || $0 == "localhost" || $0 == "*.local" }
+        let bypassStr = chromeBypassItems.joined(separator: ";")
         let chromePolicyXML = """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -386,10 +425,12 @@ final class ProxyService {
         let plistPath = "\(homeDir)/Library/LaunchAgents/com.clash.proxyguard.plist"
         let guardScript = "\(homeDir)/.local/bin/clash-proxy-guard.sh"
 
+        // 1. Unload launchd guard
         _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
         guardLoaded = false
         log("守护已停止", .success)
 
+        // 2. Turn off system proxy
         let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
         let services = svcResult.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
         for service in services {
@@ -399,16 +440,66 @@ final class ProxyService {
             _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsecurewebproxystate", trimmed, "off"])
             _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", trimmed, "off"])
         }
+        systemProxyEnabled = false
         log("系统代理已关闭", .success)
 
+        // 3. Remove Chrome policies
         _ = await CommandRunner.run("/usr/bin/defaults", ["delete", "\(homeDir)/Library/Preferences/com.google.Chrome.plist", "ProxySettings"])
         try? FileManager.default.removeItem(atPath: "\(homeDir)/Library/Application Support/Google/Chrome/Managed/com.google.Chrome.plist")
         chromePolicyInstalled = false
         log("Chrome 策略已移除", .success)
 
+        // 4. Remove Clash merge configs
+        let mergePaths = [
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/merge.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/merge.yaml",
+        ]
+        for path in mergePaths {
+            if FileManager.default.fileExists(atPath: path) {
+                try? FileManager.default.removeItem(atPath: path)
+                log("已清理 merge 配置: \((path as NSString).lastPathComponent)", .success)
+            }
+        }
+
+        // 5. Reload Clash config
+        let sighupRes = await CommandRunner.runShell("kill -HUP $(pgrep -f mihomo) 2>/dev/null")
+        if sighupRes.succeeded {
+            log("Clash 配置已重载（已恢复原始路由）", .success)
+        } else {
+            // Fallback to API reload
+            var secret = ""
+            let configPaths = [
+                "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/config.yaml",
+                "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml",
+            ]
+            for path in configPaths {
+                guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+                for line in content.components(separatedBy: "\n") {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if trimmed.hasPrefix("secret:") {
+                        secret = trimmed.replacingOccurrences(of: "secret:", with: "")
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\"", with: "")
+                    }
+                }
+                break
+            }
+            var authPart = ""
+            if !secret.isEmpty { authPart = "-H 'Authorization: Bearer \(secret)'" }
+            _ = await CommandRunner.runShell(
+                "curl -s -o /dev/null -X PUT 'http://127.0.0.1:9097/configs?force=true' -H 'Content-Type: application/json' \(authPart) -d '{}' 2>/dev/null"
+            )
+            log("Clash 配置已通过 API 重载", .info)
+        }
+
+        // 6. Clean up files
         try? FileManager.default.removeItem(atPath: plistPath)
         try? FileManager.default.removeItem(atPath: guardScript)
         log("配置文件已清理", .info)
+
+        // 7. Kill Chrome so next launch is normal (no proxy args)
+        _ = await CommandRunner.runShell("killall 'Google Chrome' 2>/dev/null")
+        log("Chrome 已退出（下次启动将不再使用代理）", .info)
 
         await refreshStatus()
         phase = .idle
