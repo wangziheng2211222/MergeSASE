@@ -388,9 +388,9 @@ final class ProxyService {
         unset ALL_PROXY
         unset all_proxy
         export NO_PROXY=\(noProxyValue)
-        export http_proxy=$HTTP_PROXY
-        export https_proxy=$HTTPS_PROXY
-        export no_proxy=$NO_PROXY
+        export http_proxy=\(proxyURL)
+        export https_proxy=\(proxyURL)
+        export no_proxy=\(noProxyValue)
         # === End MergeSASE managed proxy environment ===
         """
 
@@ -1584,10 +1584,11 @@ final class ProxyService {
 
         let codexEnvPath = "\(homeDir)/.codex/.env"
         if let content = try? String(contentsOfFile: codexEnvPath, encoding: .utf8) {
-            appEnvFixed = content.contains("company.internal")
+            appEnvFixed = content.contains("limayao.com")
                 && content.contains("197.19.0.0/16")
                 && content.contains("unset ALL_PROXY")
-                && content.contains("export no_proxy=$NO_PROXY")
+                && content.contains("export no_proxy=")
+                && !content.contains("export no_proxy=$NO_PROXY")
         } else {
             appEnvFixed = false
         }
