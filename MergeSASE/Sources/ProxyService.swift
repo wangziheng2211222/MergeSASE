@@ -103,11 +103,11 @@ final class ProxyService {
         case .loading:
             return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "余额…"
         case .unauthorized:
-            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "余额过期"
+            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "请授权"
         case .error:
             return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "余额失败"
         case .unconfigured:
-            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? (developerCredential.isEmpty ? "余额--" : "余额")
+            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? (developerCredential.isEmpty ? "请授权" : "余额")
         }
     }
     var menuBarBalanceStatusText: String {
@@ -117,7 +117,7 @@ final class ProxyService {
         case .loading:
             return "正在刷新余额"
         case .unauthorized:
-            return "登录态已过期"
+            return "需要重新授权"
         case .error:
             return "刷新失败"
         case .unconfigured:
@@ -584,8 +584,8 @@ final class ProxyService {
         let credential = developerCredential.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !credential.isEmpty else {
             developerBalanceStatus = .unconfigured
-            developerBalanceSummary = "未配置"
-            developerBalanceDetail = "请先粘贴 session_id 或完整 Cookie"
+            developerBalanceSummary = "请授权"
+            developerBalanceDetail = "授权后即可读取开发者余额"
             developerBalanceDeltaText = ""
             log("开发者余额未配置登录态", .warn)
             return
@@ -608,10 +608,10 @@ final class ProxyService {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             developerBalanceLastChecked = Date()
 
-            if statusCode == 401 {
+            if statusCode == 401 || statusCode == 403 {
                 developerBalanceStatus = .unauthorized
-                developerBalanceSummary = "登录过期"
-                developerBalanceDetail = "接口返回 401，请重新粘贴 ai.limayao.com 的 session_id"
+                developerBalanceSummary = "请授权"
+                developerBalanceDetail = "登录态无效或已过期，请重新授权"
                 developerBalanceFields = []
                 log("开发者余额查询失败: 登录态无效或已过期", .warn)
                 return

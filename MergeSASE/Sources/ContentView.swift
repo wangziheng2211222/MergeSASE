@@ -276,6 +276,19 @@ struct ContentView: View {
                 .padding(.top, 1)
             }
 
+            if shouldShowDeveloperAuthorizationPrompt {
+                Button {
+                    showDeveloperLogin = true
+                } label: {
+                    Label(developerAuthorizationTitle, systemImage: "person.crop.circle.badge.plus")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .help(developerAuthorizationHelp)
+            }
+
             if showDeveloperBalance {
                 Divider().opacity(0.35)
 
@@ -526,11 +539,16 @@ struct ContentView: View {
     private var developerAuthorizationTitle: String {
         if svc.developerCredential.isEmpty { return "授权登录" }
         switch svc.developerBalanceStatus {
-        case .unauthorized, .error:
+        case .unauthorized:
+            return "重新授权"
+        case .error:
             return "重新授权"
         default:
             return "已授权"
         }
+    }
+    private var shouldShowDeveloperAuthorizationPrompt: Bool {
+        svc.developerCredential.isEmpty || svc.developerBalanceStatus == .unauthorized
     }
     private var developerAuthorizationIcon: String? {
         developerAuthorizationTitle == "已授权" ? nil : "qrcode.viewfinder"
