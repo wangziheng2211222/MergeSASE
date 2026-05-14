@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Security
 
 enum AppPhase: String { case idle, starting, running, stopping, error }
 
@@ -20,6 +21,46 @@ struct NetworkCheckResult {
     var latencyMs: String = ""
 }
 
+enum DeveloperBalanceStatus {
+    case unconfigured
+    case loading
+    case ok
+    case unauthorized
+    case error
+}
+
+struct BalanceField {
+    let key: String
+    let value: String
+}
+
+struct ProxyEndpointSnapshot: Codable {
+    var enabled: Bool
+    var server: String
+    var port: String
+}
+
+struct NetworkServiceSnapshot: Codable {
+    var service: String
+    var web: ProxyEndpointSnapshot
+    var secureWeb: ProxyEndpointSnapshot
+    var socks: ProxyEndpointSnapshot
+    var bypassDomains: [String]
+}
+
+struct FileSnapshot: Codable {
+    var path: String
+    var existed: Bool
+    var backupName: String?
+}
+
+struct RestoreSnapshot: Codable {
+    var createdAt: Date
+    var networkServices: [NetworkServiceSnapshot]
+    var files: [FileSnapshot]
+    var launchdEnvironment: [String: String?]?
+}
+
 @MainActor
 @Observable
 final class ProxyService {
@@ -30,6 +71,8 @@ final class ProxyService {
     var proxyHost: String = "127.0.0.1"
     var guardLoaded = false
     var chromePolicyInstalled = false
+    var appEnvFixed = false
+    var networkCheckInProgress = false
     var internalResult = NetworkCheckResult()
     var externalResult = NetworkCheckResult()
     var logs: [LogLine] = []
@@ -38,8 +81,84 @@ final class ProxyService {
     }
     var statusMessage: String = "就绪"
     var newDomain: String = ""
+    var developerCredential: String = ""
+    var developerBalanceStatus: DeveloperBalanceStatus = .unconfigured
+    var developerBalanceSummary: String = "未配置"
+    var developerBalanceDetail: String = "粘贴 ai.limayao.com 登录后的 session_id 或 Cookie"
+    var developerBalanceLastChecked: Date?
+    var developerBalanceFields: [BalanceField] = []
+    var developerBalanceDeltaText: String = ""
+    var developerBalanceAmount: Double?
+    var developerRequestCount: Double?
+    var developerAutoRefreshEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(developerAutoRefreshEnabled, forKey: "developerAutoRefreshEnabled")
+            configureDeveloperAutoRefreshTimer()
+        }
+    }
+    var menuBarBalanceTitle: String {
+        switch developerBalanceStatus {
+        case .ok:
+            return developerBalanceSummary.isEmpty ? "余额" : developerBalanceSummary
+        case .loading:
+            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "余额…"
+        case .unauthorized:
+            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "余额过期"
+        case .error:
+            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "余额失败"
+        case .unconfigured:
+            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? (developerCredential.isEmpty ? "余额--" : "余额")
+        }
+    }
+    var menuBarBalanceStatusText: String {
+        switch developerBalanceStatus {
+        case .ok:
+            return developerBalanceLastChecked.map { "已更新 \(Self.shortTimeFormatter.string(from: $0))" } ?? "余额已刷新"
+        case .loading:
+            return "正在刷新余额"
+        case .unauthorized:
+            return "登录态已过期"
+        case .error:
+            return "刷新失败"
+        case .unconfigured:
+            return developerCredential.isEmpty ? "未配置登录态" : "已保存登录态，等待刷新"
+        }
+    }
+    var menuBarBalanceSystemImage: String {
+        switch developerBalanceStatus {
+        case .ok:
+            return "creditcard.fill"
+        case .loading:
+            return "arrow.clockwise"
+        case .unauthorized:
+            return "person.crop.circle.badge.exclamationmark"
+        case .error:
+            return "exclamationmark.triangle.fill"
+        case .unconfigured:
+            return "creditcard"
+        }
+    }
 
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
+    private let developerBalanceURL = URL(string: "https://ai.limayao.com/api/user/developer-dashboard")!
+    private let developerCredentialKey = "ai.limayao.com.session"
+    private let developerLastBalanceKey = "developerLastBalanceAmount"
+    private let developerLastRequestCountKey = "developerLastRequestCount"
+    private var backupDir: String { "\(homeDir)/Library/Application Support/MergeSASE/Backup" }
+    private var snapshotPath: String { "\(backupDir)/snapshot.json" }
+    private let managedProxyKeys = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]
+    private let managedAllProxyKeys = ["ALL_PROXY", "all_proxy"]
+    private let managedNoProxyKeys = ["NO_PROXY", "no_proxy"]
+    private var managedEnvKeys: [String] { managedProxyKeys + managedAllProxyKeys + managedNoProxyKeys }
+    private let proxyRequiredHosts: [String] = []
+    private let directCompanyHosts = ["ai.limayao.com", "ai-platform-cicada-llm-api.limayao.com"]
+    private var startupNetworkCheckCompleted = false
+    private var developerAutoRefreshTimer: Timer?
+    private static let shortTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
 
     init() {
         let saved = UserDefaults.standard.stringArray(forKey: "companyDomains") ?? []
@@ -50,12 +169,348 @@ final class ProxyService {
         } else {
             self.companyDomains = saved
         }
-        Task { await refreshStatus() }
+        if UserDefaults.standard.object(forKey: "developerAutoRefreshDefaultedV2") == nil {
+            self.developerAutoRefreshEnabled = true
+            UserDefaults.standard.set(true, forKey: "developerAutoRefreshDefaultedV2")
+            UserDefaults.standard.set(true, forKey: "developerAutoRefreshEnabled")
+        } else {
+            self.developerAutoRefreshEnabled = UserDefaults.standard.bool(forKey: "developerAutoRefreshEnabled")
+        }
+        if UserDefaults.standard.object(forKey: developerLastBalanceKey) != nil {
+            self.developerBalanceAmount = UserDefaults.standard.double(forKey: developerLastBalanceKey)
+        }
+        if UserDefaults.standard.object(forKey: developerLastRequestCountKey) != nil {
+            self.developerRequestCount = UserDefaults.standard.double(forKey: developerLastRequestCountKey)
+        }
+        self.developerCredential = KeychainStore.read(key: developerCredentialKey) ?? ""
+        if !developerCredential.isEmpty {
+            developerBalanceSummary = "可刷新"
+            developerBalanceDetail = "已保存登录态，点击刷新读取当前额度"
+        }
+        configureDeveloperAutoRefreshTimer()
+        Task {
+            await refreshStatus()
+            if !developerCredential.isEmpty {
+                await refreshDeveloperBalance()
+            }
+        }
     }
 
     private func log(_ text: String, _ level: LogLevel = .info) {
         logs.append(LogLine(timestamp: Date(), text: text, level: level))
         if logs.count > 500 { logs.removeFirst(100) }
+    }
+
+    private func managedPaths() -> (plist: String, guardScript: String, mergePaths: [String], chromePaths: [String]) {
+        let plistPath = "\(homeDir)/Library/LaunchAgents/com.clash.proxyguard.plist"
+        let guardScript = "\(homeDir)/.local/bin/clash-proxy-guard.sh"
+        let codexEnvPath = "\(homeDir)/.codex/.env"
+        let mergePaths = [
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/merge.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/merge.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/dns_config.yaml",
+        ]
+        let chromePaths = [
+            "\(homeDir)/Library/Preferences/com.google.Chrome.plist",
+            "\(homeDir)/Library/Application Support/Google/Chrome/Managed/com.google.Chrome.plist",
+        ]
+        return (plistPath, guardScript, mergePaths + [codexEnvPath], chromePaths)
+    }
+
+    private func parseProxyEndpoint(_ output: String) -> ProxyEndpointSnapshot {
+        var enabled = false
+        var server = ""
+        var port = ""
+        for line in output.components(separatedBy: "\n") {
+            let parts = line.components(separatedBy: ":")
+            guard parts.count >= 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespaces)
+            let value = parts.dropFirst().joined(separator: ":").trimmingCharacters(in: .whitespaces)
+            if key == "Enabled" { enabled = value.lowercased().hasPrefix("yes") }
+            if key == "Server" { server = value }
+            if key == "Port" { port = value }
+        }
+        return ProxyEndpointSnapshot(enabled: enabled, server: server, port: port)
+    }
+
+    private func parseBypassDomains(_ output: String) -> [String] {
+        output.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.lowercased().contains("there aren't any") }
+    }
+
+    private func normalizedHost(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "*.", with: "")
+            .replacingOccurrences(of: "+.", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+
+    private func host(_ host: String, isUnder domain: String) -> Bool {
+        let host = normalizedHost(host)
+        let domain = normalizedHost(domain)
+        return host == domain || host.hasSuffix(".\(domain)")
+    }
+
+    private func domainHasProxyRequiredHost(_ domain: String) -> Bool {
+        proxyRequiredHosts.contains { host($0, isUnder: domain) }
+    }
+
+    private func broadBypassItems(for domain: String) -> [String] {
+        let domain = normalizedHost(domain)
+        guard !domain.isEmpty else { return [] }
+        if domainHasProxyRequiredHost(domain) {
+            return directCompanyHosts.filter { host($0, isUnder: domain) }
+        }
+        return [domain, "*.\(domain)"]
+    }
+
+    private func bypassItemCoversProxyRequiredHost(_ item: String) -> Bool {
+        let domain = normalizedHost(item)
+        guard !domain.isEmpty, !domain.contains("/") else { return false }
+        return proxyRequiredHosts.contains { host($0, isUnder: domain) }
+    }
+
+    private func appBypassItems(_ items: [String]) -> [String] {
+        var output: [String] = []
+        for item in items {
+            if bypassItemCoversProxyRequiredHost(item) {
+                output.append(contentsOf: broadBypassItems(for: item))
+            } else {
+                output.append(item)
+            }
+        }
+        var seen = Set<String>()
+        return output.filter { seen.insert($0).inserted }
+    }
+
+    private func noProxyItems(from bypassItems: [String]) -> [String] {
+        var items: [String] = ["localhost", "127.0.0.1", "::1"]
+        for item in appBypassItems(bypassItems) {
+            if item == "*.local" {
+                items.append(".local")
+            } else if item.hasPrefix("*.") {
+                let suffix = String(item.dropFirst(1))
+                items.append(suffix)
+                items.append(String(item.dropFirst(2)))
+            } else {
+                items.append(item)
+            }
+        }
+
+        for domain in companyDomains {
+            for item in broadBypassItems(for: domain) {
+                items.append(item)
+                if item.hasPrefix("*.") {
+                    let suffix = String(item.dropFirst(1))
+                    items.append(suffix)
+                    items.append(String(item.dropFirst(2)))
+                }
+            }
+        }
+        items.append(contentsOf: directCompanyHosts)
+
+        var seen = Set<String>()
+        return items.filter { seen.insert($0).inserted }
+    }
+
+    private func setLaunchdNoProxy(_ bypassItems: [String]) async {
+        let value = noProxyItems(from: bypassItems).joined(separator: ",")
+        for key in managedNoProxyKeys {
+            _ = await CommandRunner.run("/bin/launchctl", ["setenv", key, value])
+        }
+        log("已设置应用环境 NO_PROXY/no_proxy（ccswitch 等非浏览器应用需重启后生效）", .success)
+    }
+
+    private func setLaunchdProxy(port: Int) async {
+        let proxyURL = "http://127.0.0.1:\(port)"
+        for key in managedProxyKeys {
+            _ = await CommandRunner.run("/bin/launchctl", ["setenv", key, proxyURL])
+        }
+        for key in managedAllProxyKeys {
+            _ = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
+        }
+        log("已设置应用环境 HTTP_PROXY/HTTPS_PROXY（ccswitch 等非浏览器应用需重启后生效）", .success)
+        log("已清理应用环境 ALL_PROXY/all_proxy，避免强制兜底走 Clash", .success)
+    }
+
+    private func writeAppEnvironment(port: Int, bypassItems: [String]) async {
+        let codexDir = "\(homeDir)/.codex"
+        let codexEnvPath = "\(codexDir)/.env"
+        let proxyURL = "http://127.0.0.1:\(port)"
+        let noProxyValue = noProxyItems(from: bypassItems).joined(separator: ",")
+
+        try? FileManager.default.createDirectory(atPath: codexDir, withIntermediateDirectories: true)
+        let existing = (try? String(contentsOfFile: codexEnvPath, encoding: .utf8)) ?? ""
+        var kept: [String] = []
+        var skippingManagedBlock = false
+
+        for line in existing.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == "# === MergeSASE managed proxy environment ===" {
+                skippingManagedBlock = true
+                continue
+            }
+            if trimmed == "# === End MergeSASE managed proxy environment ===" {
+                skippingManagedBlock = false
+                continue
+            }
+            if skippingManagedBlock { continue }
+
+            let isOldProxyLine = [
+                "export HTTP_PROXY=", "export HTTPS_PROXY=", "export ALL_PROXY=",
+                "export http_proxy=", "export https_proxy=", "export all_proxy=",
+                "export NO_PROXY=", "export no_proxy=",
+                "unset ALL_PROXY", "unset all_proxy"
+            ].contains { trimmed.hasPrefix($0) }
+
+            if !isOldProxyLine {
+                kept.append(line)
+            }
+        }
+
+        while kept.last?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+            kept.removeLast()
+        }
+
+        let block = """
+
+        # === MergeSASE managed proxy environment ===
+        export HTTP_PROXY=\(proxyURL)
+        export HTTPS_PROXY=\(proxyURL)
+        # Public traffic can still use HTTP(S)_PROXY; company SASE traffic must bypass Clash.
+        unset ALL_PROXY
+        unset all_proxy
+        export NO_PROXY=\(noProxyValue)
+        export http_proxy=$HTTP_PROXY
+        export https_proxy=$HTTPS_PROXY
+        export no_proxy=$NO_PROXY
+        # === End MergeSASE managed proxy environment ===
+        """
+
+        do {
+            try (kept.joined(separator: "\n") + block + "\n").write(toFile: codexEnvPath, atomically: true, encoding: .utf8)
+            appEnvFixed = true
+            log("Codex/应用代理环境已修复: limayao 与 SASE 网段直连，公网仍走 Clash", .success)
+        } catch {
+            appEnvFixed = false
+            log("Codex/应用代理环境写入失败: \(error.localizedDescription)", .warn)
+        }
+    }
+
+    private func restoreLaunchdEnvironment(_ snapshot: RestoreSnapshot) async {
+        let launchdEnvironment = snapshot.launchdEnvironment ?? [:]
+        for key in managedEnvKeys {
+            if let stored = launchdEnvironment[key], let value = stored, !value.isEmpty {
+                _ = await CommandRunner.run("/bin/launchctl", ["setenv", key, value])
+            } else {
+                _ = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
+            }
+        }
+    }
+
+    private func takeRestoreSnapshotIfNeeded() async {
+        if FileManager.default.fileExists(atPath: snapshotPath) {
+            log("已存在启动前快照，本次不覆盖", .info)
+            return
+        }
+
+        try? FileManager.default.removeItem(atPath: backupDir)
+        try? FileManager.default.createDirectory(atPath: backupDir, withIntermediateDirectories: true)
+
+        let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
+        let services = svcResult.stdout.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("*") }
+
+        var networkSnapshots: [NetworkServiceSnapshot] = []
+        for service in services {
+            let web = await CommandRunner.run("/usr/sbin/networksetup", ["-getwebproxy", service])
+            let secure = await CommandRunner.run("/usr/sbin/networksetup", ["-getsecurewebproxy", service])
+            let socks = await CommandRunner.run("/usr/sbin/networksetup", ["-getsocksfirewallproxy", service])
+            let bypass = await CommandRunner.run("/usr/sbin/networksetup", ["-getproxybypassdomains", service])
+            networkSnapshots.append(NetworkServiceSnapshot(
+                service: service,
+                web: parseProxyEndpoint(web.stdout),
+                secureWeb: parseProxyEndpoint(secure.stdout),
+                socks: parseProxyEndpoint(socks.stdout),
+                bypassDomains: parseBypassDomains(bypass.stdout)
+            ))
+        }
+
+        let paths = managedPaths()
+        let filePaths = paths.chromePaths + paths.mergePaths + [paths.plist, paths.guardScript]
+        var fileSnapshots: [FileSnapshot] = []
+        for (idx, path) in filePaths.enumerated() {
+            if FileManager.default.fileExists(atPath: path) {
+                let backupName = "file_\(idx)"
+                try? FileManager.default.copyItem(atPath: path, toPath: "\(backupDir)/\(backupName)")
+                fileSnapshots.append(FileSnapshot(path: path, existed: true, backupName: backupName))
+            } else {
+                fileSnapshots.append(FileSnapshot(path: path, existed: false, backupName: nil))
+            }
+        }
+
+        var launchdEnvironment: [String: String?] = [:]
+        for key in managedEnvKeys {
+            let envRes = await CommandRunner.run("/bin/launchctl", ["getenv", key])
+            launchdEnvironment[key] = envRes.succeeded && !envRes.stdout.isEmpty ? envRes.stdout : nil
+        }
+
+        let snapshot = RestoreSnapshot(
+            createdAt: Date(),
+            networkServices: networkSnapshots,
+            files: fileSnapshots,
+            launchdEnvironment: launchdEnvironment
+        )
+        if let data = try? JSONEncoder().encode(snapshot) {
+            try? data.write(to: URL(fileURLWithPath: snapshotPath), options: .atomic)
+            log("启动前配置快照已保存", .success)
+        } else {
+            log("启动前配置快照保存失败，停止时只能执行清理式还原", .warn)
+        }
+    }
+
+    private func restoreEndpoint(_ endpoint: ProxyEndpointSnapshot, service: String, setCommand: String, stateCommand: String) async {
+        if !endpoint.server.isEmpty, let port = Int(endpoint.port) {
+            _ = await CommandRunner.run("/usr/sbin/networksetup", [setCommand, service, endpoint.server, "\(port)"])
+        }
+        _ = await CommandRunner.run("/usr/sbin/networksetup", [stateCommand, service, endpoint.enabled ? "on" : "off"])
+    }
+
+    private func restoreStartupSnapshot() async -> Bool {
+        guard
+            let data = try? Data(contentsOf: URL(fileURLWithPath: snapshotPath)),
+            let snapshot = try? JSONDecoder().decode(RestoreSnapshot.self, from: data)
+        else {
+            return false
+        }
+
+        for item in snapshot.networkServices {
+            await restoreEndpoint(item.web, service: item.service, setCommand: "-setwebproxy", stateCommand: "-setwebproxystate")
+            await restoreEndpoint(item.secureWeb, service: item.service, setCommand: "-setsecurewebproxy", stateCommand: "-setsecurewebproxystate")
+            await restoreEndpoint(item.socks, service: item.service, setCommand: "-setsocksfirewallproxy", stateCommand: "-setsocksfirewallproxystate")
+            if item.bypassDomains.isEmpty {
+                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setproxybypassdomains", item.service, "Empty"])
+            } else {
+                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setproxybypassdomains", item.service] + item.bypassDomains)
+            }
+        }
+        await restoreLaunchdEnvironment(snapshot)
+
+        for file in snapshot.files {
+            let dir = (file.path as NSString).deletingLastPathComponent
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? FileManager.default.removeItem(atPath: file.path)
+            if file.existed, let backupName = file.backupName {
+                try? FileManager.default.copyItem(atPath: "\(backupDir)/\(backupName)", toPath: file.path)
+            }
+        }
+
+        try? FileManager.default.removeItem(atPath: backupDir)
+        log("已按启动前快照恢复系统代理、Chrome、Clash 和守护配置", .success)
+        return true
     }
 
     func addDomain(_ domain: String) {
@@ -67,6 +522,328 @@ final class ProxyService {
     func removeDomain(_ domain: String) {
         companyDomains.removeAll { $0 == domain }
         if companyDomains.isEmpty { companyDomains = ["cds8.cn", "limayao.com"] }
+    }
+
+    // MARK: - Developer Balance
+
+    func saveDeveloperCredential() {
+        let value = developerCredential.trimmingCharacters(in: .whitespacesAndNewlines)
+        developerCredential = value
+        if value.isEmpty {
+            KeychainStore.delete(key: developerCredentialKey)
+            developerBalanceStatus = .unconfigured
+            developerBalanceSummary = "未配置"
+            developerBalanceDetail = "粘贴 ai.limayao.com 登录后的 session_id 或 Cookie"
+            developerBalanceFields = []
+            developerBalanceDeltaText = ""
+            developerBalanceAmount = nil
+            developerRequestCount = nil
+            UserDefaults.standard.removeObject(forKey: developerLastBalanceKey)
+            UserDefaults.standard.removeObject(forKey: developerLastRequestCountKey)
+            configureDeveloperAutoRefreshTimer()
+            log("开发者余额登录态已清除", .info)
+        } else if KeychainStore.write(value, key: developerCredentialKey) {
+            developerBalanceSummary = "已保存"
+            developerBalanceDetail = "点击刷新读取当前额度"
+            configureDeveloperAutoRefreshTimer()
+            log("开发者余额登录态已保存到 Keychain", .success)
+        } else {
+            developerBalanceStatus = .error
+            developerBalanceSummary = "保存失败"
+            developerBalanceDetail = "Keychain 写入失败"
+            log("开发者余额登录态保存失败", .error)
+        }
+    }
+
+    func saveDeveloperCredential(_ value: String) {
+        developerCredential = value
+        saveDeveloperCredential()
+    }
+
+    func clearDeveloperCredential() {
+        developerCredential = ""
+        developerAutoRefreshEnabled = false
+        saveDeveloperCredential()
+    }
+
+    private func configureDeveloperAutoRefreshTimer() {
+        developerAutoRefreshTimer?.invalidate()
+        developerAutoRefreshTimer = nil
+
+        let credential = developerCredential.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard developerAutoRefreshEnabled, !credential.isEmpty else { return }
+
+        developerAutoRefreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            Task { @MainActor in
+                await self.refreshDeveloperBalance()
+            }
+        }
+    }
+
+    func refreshDeveloperBalance() async {
+        let credential = developerCredential.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !credential.isEmpty else {
+            developerBalanceStatus = .unconfigured
+            developerBalanceSummary = "未配置"
+            developerBalanceDetail = "请先粘贴 session_id 或完整 Cookie"
+            developerBalanceDeltaText = ""
+            log("开发者余额未配置登录态", .warn)
+            return
+        }
+
+        developerBalanceStatus = .loading
+        developerBalanceSummary = "查询中…"
+        developerBalanceDetail = "正在读取 /api/user/developer-dashboard"
+
+        var request = URLRequest(url: developerBalanceURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 12
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.setValue(cookieHeader(from: credential), forHTTPHeaderField: "Cookie")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("MergeSASE/1.0", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            developerBalanceLastChecked = Date()
+
+            if statusCode == 401 {
+                developerBalanceStatus = .unauthorized
+                developerBalanceSummary = "登录过期"
+                developerBalanceDetail = "接口返回 401，请重新粘贴 ai.limayao.com 的 session_id"
+                developerBalanceFields = []
+                log("开发者余额查询失败: 登录态无效或已过期", .warn)
+                return
+            }
+
+            guard (200..<300).contains(statusCode) else {
+                developerBalanceStatus = .error
+                developerBalanceSummary = "HTTP \(statusCode)"
+                developerBalanceDetail = compactResponseText(data)
+                developerBalanceFields = []
+                log("开发者余额查询失败: HTTP \(statusCode)", .error)
+                return
+            }
+
+            let parsed = parseBalanceResponse(data)
+            developerBalanceStatus = .ok
+            developerBalanceSummary = parsed.summary
+            developerBalanceDetail = parsed.detail
+            developerBalanceFields = parsed.fields
+            updateBalanceChange(newAmount: parsed.amount, requestCount: parsed.requestCount)
+            log("开发者余额已刷新: \(parsed.summary)", .success)
+        } catch {
+            developerBalanceStatus = .error
+            developerBalanceSummary = "查询失败"
+            developerBalanceDetail = error.localizedDescription
+            developerBalanceFields = []
+            log("开发者余额查询失败: \(error.localizedDescription)", .error)
+        }
+    }
+
+    private func updateBalanceChange(newAmount: Double?, requestCount: Double?) {
+        if let requestCount {
+            if let oldCount = developerRequestCount {
+                let diff = requestCount - oldCount
+                if abs(diff) >= 0.5 {
+                    developerBalanceDeltaText = "相比上次 -\(formatCount(abs(diff)))"
+                } else {
+                    developerBalanceDeltaText = "相比上次 -0.0"
+                }
+            } else {
+                developerBalanceDeltaText = "相比上次 -0.0"
+            }
+            developerRequestCount = requestCount
+            UserDefaults.standard.set(requestCount, forKey: developerLastRequestCountKey)
+        }
+
+        if let newAmount {
+            developerBalanceAmount = newAmount
+            UserDefaults.standard.set(newAmount, forKey: developerLastBalanceKey)
+        }
+    }
+
+    private func cookieHeader(from value: String) -> String {
+        if value.contains("=") || value.contains(";") {
+            return value
+        }
+        return "session_id=\(value)"
+    }
+
+    private func parseBalanceResponse(_ data: Data) -> (summary: String, detail: String, fields: [BalanceField], amount: Double?, requestCount: Double?) {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else {
+            return ("已返回", compactResponseText(data), [], nil, nil)
+        }
+
+        if let dashboard = parseDashboardStats(object) {
+            return dashboard
+        }
+
+        let flattened = flattenJSON(object)
+        let matches = flattened
+            .filter { isBalanceLikeKey($0.key) }
+            .sorted { balanceKeyPriority($0.key) < balanceKeyPriority($1.key) }
+
+        let fields = matches.prefix(6).map { BalanceField(key: $0.key, value: $0.value) }
+        if let first = matches.first {
+            let detail = fields.map { "\($0.key): \($0.value)" }.joined(separator: " · ")
+            return (first.value, detail, fields, currencyAmount(from: first.value), nil)
+        }
+
+        if let detail = flattened.first(where: { $0.key.lowercased().hasSuffix("detail") })?.value {
+            return ("已返回", detail, [], nil, nil)
+        }
+
+        return ("已返回", compactResponseText(data), [], nil, nil)
+    }
+
+    private func parseDashboardStats(_ object: Any) -> (summary: String, detail: String, fields: [BalanceField], amount: Double?, requestCount: Double?)? {
+        guard
+            let root = object as? [String: Any],
+            let data = root["data"] as? [String: Any],
+            let cards = data["stats_cards"] as? [String: Any]
+        else {
+            return nil
+        }
+
+        let preferredKeys = [
+            "current_balance",
+            "historical_consumed",
+            "request_count",
+            "statistics_count",
+            "statistics_quota",
+            "statistics_tokens"
+        ]
+        var values: [String: BalanceField] = [:]
+        var numericValues: [String: Double] = [:]
+
+        for card in cards.values {
+            guard
+                let cardDict = card as? [String: Any],
+                let items = cardDict["items"] as? [[String: Any]]
+            else {
+                continue
+            }
+
+            for item in items {
+                guard let metricKey = item["key"] as? String else { continue }
+                let label = item["label"] as? String ?? metricKey
+                let display = item["display"] as? String
+                    ?? (item["value_usd"] as? NSNumber)?.stringValue
+                    ?? (item["value"] as? NSNumber)?.stringValue
+                    ?? ""
+                guard !display.isEmpty else { continue }
+                values[metricKey] = BalanceField(key: label, value: display)
+                if let value = item["value_usd"] as? NSNumber {
+                    numericValues[metricKey] = value.doubleValue
+                } else if let value = item["value"] as? NSNumber {
+                    numericValues[metricKey] = value.doubleValue
+                }
+            }
+        }
+
+        var currentAmount: Double?
+        if let current = numericValues["current_balance"], let periodCost = numericValues["statistics_quota"] {
+            currentAmount = current + periodCost
+            values["current_balance"] = BalanceField(
+                key: "当前余额",
+                value: formatCurrentBalance(current + periodCost)
+            )
+        }
+
+        let fields = preferredKeys.compactMap { values[$0] }
+        guard let current = values["current_balance"], !fields.isEmpty else {
+            return nil
+        }
+
+        let detail = fields
+            .dropFirst()
+            .map { "\($0.key): \($0.value)" }
+            .joined(separator: " · ")
+        return (current.value, detail, fields, currentAmount ?? currencyAmount(from: current.value), numericValues["request_count"])
+    }
+
+    private func currencyAmount(from value: String) -> Double? {
+        let cleaned = value
+            .replacingOccurrences(of: "$", with: "")
+            .replacingOccurrences(of: ",", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Double(cleaned)
+    }
+
+    private func formatCurrentBalance(_ value: Double) -> String {
+        let whole = floor(value)
+        return "$\(Int(whole))"
+    }
+
+    private func formatMenuBarBalance(_ value: Double) -> String {
+        formatCurrentBalance(value)
+    }
+
+    private func formatCount(_ value: Double) -> String {
+        if value >= 1_000_000 {
+            return "\(String(format: "%.1f", value / 1_000_000))M"
+        }
+        if value >= 1_000 {
+            return "\(String(format: "%.1f", value / 1_000))K"
+        }
+        return "\(Int(value.rounded()))"
+    }
+
+    private func isBalanceLikeKey(_ key: String) -> Bool {
+        let lower = key.lowercased()
+        if lower.contains("model") || lower.contains("chart") || lower.contains("history") || lower.contains("log") {
+            return false
+        }
+        return [
+            "balance", "remain", "remaining", "quota", "credit", "amount",
+            "available", "left", "surplus", "余额", "剩余", "额度"
+        ].contains { lower.contains($0) }
+    }
+
+    private func balanceKeyPriority(_ key: String) -> Int {
+        let lower = key.lowercased()
+        let priorities = [
+            "balance", "current_balance", "available_balance", "remaining_balance",
+            "remain_quota", "remaining_quota", "available_quota", "current_quota",
+            "remaining", "available", "left", "credit", "quota", "amount", "total"
+        ]
+        for (index, item) in priorities.enumerated() where lower.contains(item) {
+            return index
+        }
+        return 100
+    }
+
+    private func flattenJSON(_ object: Any, prefix: String = "") -> [(key: String, value: String)] {
+        if let dict = object as? [String: Any] {
+            return dict.flatMap { key, value in
+                flattenJSON(value, prefix: prefix.isEmpty ? key : "\(prefix).\(key)")
+            }
+        }
+        if let array = object as? [Any] {
+            return array.enumerated().flatMap { index, value in
+                flattenJSON(value, prefix: "\(prefix)[\(index)]")
+            }
+        }
+        let value: String
+        if object is NSNull {
+            value = "null"
+        } else if let number = object as? NSNumber {
+            value = number.stringValue
+        } else {
+            value = "\(object)"
+        }
+        return [(prefix, value)]
+    }
+
+    private func compactResponseText(_ data: Data) -> String {
+        let text = String(data: data, encoding: .utf8) ?? "\(data.count) bytes"
+        let oneLine = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(oneLine.prefix(240))
     }
 
     // MARK: - Port Detection
@@ -100,20 +877,34 @@ final class ProxyService {
 
     private func writeMergeConfig(port: Int) async {
         // Resolve company domains to find internal IP ranges
-        var internalRanges = Set(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+        var internalRanges = Set(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16", "198.18.0.0/16"])
         for domain in companyDomains {
-            let digRes = await CommandRunner.runShell("dig +short \(domain) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
-            let ip = digRes.stdout.trimmingCharacters(in: .whitespaces)
-            if !ip.isEmpty {
-                let parts = ip.components(separatedBy: ".")
-                if parts.count == 4 {
-                    internalRanges.insert("\(parts[0]).\(parts[1]).0.0/16")
+            for prefix in ["", "new-api", "api", "www", "portal", "vpn"] {
+                let host = prefix.isEmpty ? domain : "\(prefix).\(domain)"
+                let digRes = await CommandRunner.runShell("dig +short \(host) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
+                let ip = digRes.stdout.trimmingCharacters(in: .whitespaces)
+                if !ip.isEmpty {
+                    let parts = ip.components(separatedBy: ".")
+                    if parts.count == 4 {
+                        internalRanges.insert("\(parts[0]).\(parts[1]).0.0/16")
+                    }
+                    log("检测到公司内网 IP: \(host) → \(ip) → 排除路由 \(parts[0]).\(parts[1]).0.0/16", .info)
+                    break
                 }
-                log("检测到公司内网 IP: \(ip) → 排除路由 \(parts[0]).\(parts[1]).0.0/16", .info)
             }
         }
 
         let routeExcludeYAML = internalRanges.sorted().map { "          - '\($0)'" }.joined(separator: "\n")
+        let fakeIPFilterItems = companyDomains.flatMap { domain -> [String] in
+            if domainHasProxyRequiredHost(domain) {
+                return directCompanyHosts.filter { host($0, isUnder: domain) }
+            }
+            return ["+.\(normalizedHost(domain))"]
+        }
+        let fakeIPFilterYAML = fakeIPFilterItems.map { "    - '\($0)'" }.joined(separator: "\n")
+        let nameserverPolicyYAML = companyDomains
+            .map { "    '+.\(normalizedHost($0))': system" }
+            .joined(separator: "\n")
         let mergeContent = """
         # MergeSASE — Clash Verge Profile Enhancement
         profile:
@@ -121,8 +912,11 @@ final class ProxyService {
 
         dns:
           use-system-hosts: false
+          fake-ip-filter-mode: blacklist
           fake-ip-filter:
-            - '+.\(companyDomains.joined(separator: "'\n            - '+."))'
+        \(fakeIPFilterYAML)
+          nameserver-policy:
+        \(nameserverPolicyYAML)
 
         tun:
           enable: true
@@ -152,8 +946,110 @@ final class ProxyService {
             log("未找到 Clash Verge 配置目录，请手动将 Merge.yaml 导入 Clash Verge", .warn)
         }
 
+        await patchClashDNSConfig()
+        await patchGeneratedClashConfig()
         // Reload Clash config via API
         await reloadClashConfig(port: port)
+    }
+
+    private func patchClashDNSConfig() async {
+        let path = "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/dns_config.yaml"
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        guard var content = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+
+        let filters = companyDomains.map { "+.\(normalizedHost($0))" }
+        let policyLines = companyDomains.map { "    '+.\(normalizedHost($0))': system" }
+
+        func containsYAMLItem(_ item: String, in text: String) -> Bool {
+            text.contains("- \(item)") || text.contains("- '\(item)'") || text.contains("- \"\(item)\"")
+        }
+
+        if content.contains("fake-ip-filter:") {
+            let missing = filters.filter { !containsYAMLItem($0, in: content) }
+            if !missing.isEmpty {
+                let insertion = missing.map { "  - \($0)" }.joined(separator: "\n")
+                content = content.replacingOccurrences(of: "  fake-ip-filter:\n", with: "  fake-ip-filter:\n\(insertion)\n")
+            }
+        }
+
+        if content.contains("nameserver-policy: {}") {
+            content = content.replacingOccurrences(
+                of: "  nameserver-policy: {}",
+                with: "  nameserver-policy:\n\(policyLines.joined(separator: "\n"))"
+            )
+        } else if content.contains("nameserver-policy:") {
+            let missing = policyLines.filter { !content.contains($0) }
+            if !missing.isEmpty {
+                content = content.replacingOccurrences(of: "  nameserver-policy:\n", with: "  nameserver-policy:\n\(missing.joined(separator: "\n"))\n")
+            }
+        }
+
+        do {
+            try content.write(toFile: path, atomically: true, encoding: .utf8)
+            log("Clash DNS 配置已修复: 公司域名不再进入 fake-ip", .success)
+        } catch {
+            log("Clash DNS 配置修复失败: \(error.localizedDescription)", .warn)
+        }
+    }
+
+    private func patchGeneratedClashConfig() async {
+        let paths = [
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge-check.yaml",
+        ]
+        let filters = companyDomains.map { "+.\(normalizedHost($0))" }
+        let policyLines = companyDomains.map { "    '+.\(normalizedHost($0))': system" }
+        let directRules = companyDomains.map { "- DOMAIN-SUFFIX,\(normalizedHost($0)),DIRECT" }
+        let cidrRules = [
+            "- IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+            "- IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+            "- IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+            "- IP-CIDR,197.19.0.0/16,DIRECT,no-resolve",
+            "- IP-CIDR,198.18.0.0/16,DIRECT,no-resolve",
+        ]
+
+        for path in paths {
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            guard var content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            let original = content
+
+            if !content.contains("fake-ip-filter:") {
+                let insertion = """
+                  fake-ip-filter-mode: blacklist
+                  fake-ip-filter:
+                \(filters.map { "  - \($0)" }.joined(separator: "\n"))
+                  nameserver-policy:
+                \(policyLines.joined(separator: "\n"))
+                """
+                content = content.replacingOccurrences(of: "  fake-ip-range: 198.18.0.1/16\n", with: "  fake-ip-range: 198.18.0.1/16\n\(insertion)\n")
+            } else {
+                for filter in filters where !content.contains("- \(filter)") && !content.contains("- '\(filter)'") {
+                    content = content.replacingOccurrences(of: "  fake-ip-filter:\n", with: "  fake-ip-filter:\n  - \(filter)\n")
+                }
+                if !content.contains("nameserver-policy:") {
+                    content = content.replacingOccurrences(of: "  fake-ip-filter:\n", with: "  fake-ip-filter:\n")
+                    if let range = content.range(of: "tun:\n") {
+                        content.insert(contentsOf: "  nameserver-policy:\n\(policyLines.joined(separator: "\n"))\n", at: range.lowerBound)
+                    }
+                }
+            }
+
+            if content.contains("rules:\n") {
+                let missingRules = (directRules + cidrRules).filter { !content.contains($0) }
+                if !missingRules.isEmpty {
+                    content = content.replacingOccurrences(of: "rules:\n", with: "rules:\n\(missingRules.joined(separator: "\n"))\n")
+                }
+            }
+
+            if content != original {
+                do {
+                    try content.write(toFile: path, atomically: true, encoding: .utf8)
+                    log("Clash 运行配置已修复: \((path as NSString).lastPathComponent)", .success)
+                } catch {
+                    log("Clash 运行配置写入失败: \(error.localizedDescription)", .warn)
+                }
+            }
+        }
     }
 
     private func reloadClashConfig(port: Int) async {
@@ -237,6 +1133,8 @@ final class ProxyService {
         clashPort = port
         log("检测到 Clash 端口: \(port)", .success)
 
+        await takeRestoreSnapshotIfNeeded()
+
         // Write Clash merge config with route-exclude
         await writeMergeConfig(port: port)
 
@@ -245,10 +1143,9 @@ final class ProxyService {
         let guardScript = "\(guardDir)/clash-proxy-guard.sh"
         try? FileManager.default.createDirectory(atPath: guardDir, withIntermediateDirectories: true, attributes: nil)
         var guardBypassItems = ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
-                                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"]
+                                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16", "198.18.0.0/16"]
         for domain in companyDomains {
-            guardBypassItems.append(domain)
-            guardBypassItems.append("*.\(domain)")
+            guardBypassItems.append(contentsOf: broadBypassItems(for: domain))
             let digRes = await CommandRunner.runShell("dig +short \(domain) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
             let ip = digRes.stdout.trimmingCharacters(in: .whitespaces)
             if !ip.isEmpty {
@@ -264,12 +1161,16 @@ final class ProxyService {
 
         let guardBypassStr = guardBypassItems.map { "\"\($0)\"" }.joined(separator: " ")
         let domainLines = companyDomains.map { "    \"\($0)\"" }.joined(separator: "\n")
+        let proxyRequiredLines = proxyRequiredHosts.map { "    \"\($0)\"" }.joined(separator: "\n")
         let guardContent = """
         #!/bin/bash
         CLASH_HOST="127.0.0.1"
         CLASH_PORT="\(port)"
         COMPANY_DOMAINS=(
         \(domainLines)
+        )
+        PROXY_REQUIRED_HOSTS=(
+        \(proxyRequiredLines)
         )
         BYPASS=(\(guardBypassStr))
         while IFS= read -r service; do
@@ -319,10 +1220,9 @@ final class ProxyService {
 
         // Set system proxy — include resolved IP ranges in bypass
         var bypassList = ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
-                          "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"]
+                          "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16", "198.18.0.0/16"]
         for domain in companyDomains {
-            bypassList.append(domain)
-            bypassList.append("*.\(domain)")
+            bypassList.append(contentsOf: broadBypassItems(for: domain))
             let digRes = await CommandRunner.runShell("dig +short \(domain) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
             let ip = digRes.stdout.trimmingCharacters(in: .whitespaces)
             if !ip.isEmpty {
@@ -335,6 +1235,13 @@ final class ProxyService {
         // Deduplicate while preserving order
         var seen = Set<String>()
         bypassList = bypassList.filter { seen.insert($0).inserted }
+        await setLaunchdNoProxy(bypassList)
+        await setLaunchdProxy(port: port)
+        await writeAppEnvironment(port: port, bypassItems: bypassList)
+        if !proxyRequiredHosts.isEmpty {
+            log("以下 API 域名将强制走 Clash，不写入绕过: \(proxyRequiredHosts.joined(separator: ", "))", .info)
+        }
+
         let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
         let services = svcResult.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
         for service in services {
@@ -348,7 +1255,8 @@ final class ProxyService {
         log("系统代理已设置: \(proxyHost):\(port)", .success)
 
         // Write Chrome Managed Policy (forces proxy + bypass for all users)
-        let chromeBypassItems: [String] = companyDomains.map { "*.\($0)" } + bypassList.filter { $0.contains("/") || $0 == "127.0.0.1" || $0 == "localhost" || $0 == "*.local" }
+        let chromeDomainBypassItems = companyDomains.flatMap { broadBypassItems(for: $0) }
+        let chromeBypassItems: [String] = chromeDomainBypassItems + bypassList.filter { $0.contains("/") || $0 == "127.0.0.1" || $0 == "localhost" || $0 == "*.local" }
         let bypassStr = chromeBypassItems.joined(separator: ";")
         let chromePolicyXML = """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -430,38 +1338,49 @@ final class ProxyService {
         guardLoaded = false
         log("守护已停止", .success)
 
-        // 2. Turn off system proxy
-        let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
-        let services = svcResult.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
-        for service in services {
-            let trimmed = service.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty || trimmed.hasPrefix("An asterisk") { continue }
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setwebproxystate", trimmed, "off"])
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsecurewebproxystate", trimmed, "off"])
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", trimmed, "off"])
-        }
-        systemProxyEnabled = false
-        log("系统代理已关闭", .success)
+        let restoredFromSnapshot = await restoreStartupSnapshot()
 
-        // 3. Remove Chrome policies
-        _ = await CommandRunner.run("/usr/bin/defaults", ["delete", "\(homeDir)/Library/Preferences/com.google.Chrome.plist", "ProxySettings"])
-        try? FileManager.default.removeItem(atPath: "\(homeDir)/Library/Application Support/Google/Chrome/Managed/com.google.Chrome.plist")
-        chromePolicyInstalled = false
-        log("Chrome 策略已移除", .success)
-
-        // 4. Remove Clash merge configs
-        let mergePaths = [
-            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/merge.yaml",
-            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/merge.yaml",
-        ]
-        for path in mergePaths {
-            if FileManager.default.fileExists(atPath: path) {
-                try? FileManager.default.removeItem(atPath: path)
-                log("已清理 merge 配置: \((path as NSString).lastPathComponent)", .success)
+        if !restoredFromSnapshot {
+            // 2. Fallback: turn off the proxy and remove files managed by MergeSASE.
+            let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
+            let services = svcResult.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
+            for service in services {
+                let trimmed = service.trimmingCharacters(in: .whitespaces)
+                if trimmed.isEmpty || trimmed.hasPrefix("An asterisk") { continue }
+                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setwebproxystate", trimmed, "off"])
+                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsecurewebproxystate", trimmed, "off"])
+                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", trimmed, "off"])
             }
+            systemProxyEnabled = false
+            log("未找到启动前快照，已执行清理式系统代理关闭", .warn)
+
+            for key in managedEnvKeys {
+                _ = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
+            }
+            log("已清理 HTTP_PROXY/NO_PROXY 等应用环境变量", .info)
+
+            _ = await CommandRunner.run("/usr/bin/defaults", ["delete", "\(homeDir)/Library/Preferences/com.google.Chrome.plist", "ProxySettings"])
+            try? FileManager.default.removeItem(atPath: "\(homeDir)/Library/Application Support/Google/Chrome/Managed/com.google.Chrome.plist")
+            chromePolicyInstalled = false
+            log("Chrome 策略已移除", .success)
+
+            let mergePaths = [
+                "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/merge.yaml",
+                "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/merge.yaml",
+            ]
+            for path in mergePaths {
+                if FileManager.default.fileExists(atPath: path) {
+                    try? FileManager.default.removeItem(atPath: path)
+                    log("已清理 merge 配置: \((path as NSString).lastPathComponent)", .success)
+                }
+            }
+
+            try? FileManager.default.removeItem(atPath: plistPath)
+            try? FileManager.default.removeItem(atPath: guardScript)
+            log("配置文件已清理", .info)
         }
 
-        // 5. Reload Clash config
+        // Reload Clash config after restoring or removing merge config.
         let sighupRes = await CommandRunner.runShell("kill -HUP $(pgrep -f mihomo) 2>/dev/null")
         if sighupRes.succeeded {
             log("Clash 配置已重载（已恢复原始路由）", .success)
@@ -492,12 +1411,7 @@ final class ProxyService {
             log("Clash 配置已通过 API 重载", .info)
         }
 
-        // 6. Clean up files
-        try? FileManager.default.removeItem(atPath: plistPath)
-        try? FileManager.default.removeItem(atPath: guardScript)
-        log("配置文件已清理", .info)
-
-        // 7. Kill Chrome so next launch is normal (no proxy args)
+        // Kill Chrome so next launch no longer carries MergeSASE command-line flags.
         _ = await CommandRunner.runShell("killall 'Google Chrome' 2>/dev/null")
         log("Chrome 已退出（下次启动将不再使用代理）", .info)
 
@@ -521,9 +1435,7 @@ final class ProxyService {
     func refreshStatus() async {
         async let proxyCheck = CommandRunner.runShell("scutil --proxy 2>/dev/null")
         async let guardCheck = CommandRunner.run("/bin/launchctl", ["list", "com.clash.proxyguard"])
-        async let clashCheck = CommandRunner.runShell("ps aux 2>/dev/null | grep -iE 'mihomo' | grep -v grep")
-
-        let (proxy, guardChk, clashChk) = await (proxyCheck, guardCheck, clashCheck)
+        let (proxy, guardChk) = await (proxyCheck, guardCheck)
 
         systemProxyEnabled = proxy.stdout.contains("HTTPEnable : 1")
         if let range = proxy.stdout.range(of: "HTTPPort : ") {
@@ -534,7 +1446,7 @@ final class ProxyService {
             proxyHost = proxy.stdout[range.upperBound...].components(separatedBy: "\n").first?.trimmingCharacters(in: .whitespaces) ?? "127.0.0.1"
         }
         guardLoaded = guardChk.exitCode == 0
-        clashRunning = !clashChk.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        clashRunning = await detectClashRunning(port: clashPort)
 
         let chromePlistPath = "\(homeDir)/Library/Preferences/com.google.Chrome.plist"
         if FileManager.default.fileExists(atPath: chromePlistPath) {
@@ -544,35 +1456,127 @@ final class ProxyService {
             chromePolicyInstalled = false
         }
 
+        let codexEnvPath = "\(homeDir)/.codex/.env"
+        if let content = try? String(contentsOfFile: codexEnvPath, encoding: .utf8) {
+            appEnvFixed = content.contains("limayao.com")
+                && content.contains("197.19.0.0/16")
+                && content.contains("unset ALL_PROXY")
+                && content.contains("export no_proxy=$NO_PROXY")
+        } else {
+            appEnvFixed = false
+        }
+
         if phase == .running { statusMessage = "运行中" }
+    }
+
+    private func detectClashRunning(port: Int) async -> Bool {
+        let processCheck = await CommandRunner.runShell(
+            "pgrep -if 'verge-mihomo|mihomo|clash-verge-service|clash-verge|Clash Verge' >/dev/null && echo 1 || echo 0"
+        )
+        if processCheck.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
+            return true
+        }
+
+        let netstatCheck = await CommandRunner.runShell(
+            "netstat -anv -p tcp 2>/dev/null | grep -E '127\\.0\\.0\\.1\\.\(port)( |$)|\\.\(port)[[:space:]]' | grep -qiE 'verge-mihomo|mihomo|clash|LISTEN|ESTABLISHED' && echo 1 || echo 0"
+        )
+        if netstatCheck.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
+            return true
+        }
+
+        let lsofCheck = await CommandRunner.runShell(
+            "lsof -nP -iTCP:\(port) 2>/dev/null | grep -qiE 'verge|mihomo|clash|LISTEN|ESTABLISHED' && echo 1 || echo 0"
+        )
+        return lsofCheck.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
     }
 
     // MARK: - Network Checks (detailed)
 
-    func checkExternalNetwork() async {
-        log("检测外部网络: google.com...")
-        externalResult.url = "https://www.google.com"
-        let result = await CommandRunner.runShell(
-            "curl -s -o /dev/null -w '%{http_code}|%{time_total}|%{remote_ip}' --max-time 5 https://www.google.com 2>&1"
-        )
+    func checkNetworksOnLaunch() async {
+        guard !startupNetworkCheckCompleted else { return }
+        startupNetworkCheckCompleted = true
+
+        await refreshStatus()
+        guard phase != .starting && phase != .stopping else { return }
+
+        log("========== 打开软件后自动检测网络 ==========", .info)
+        await checkAllNetworks()
+    }
+
+    func checkAllNetworks() async {
+        guard !networkCheckInProgress else { return }
+        networkCheckInProgress = true
+        defer { networkCheckInProgress = false }
+
+        await checkInternalNetwork()
+        await checkExternalNetwork()
+    }
+
+    private func externalCurl(proxyURL: String?) async -> (code: String, latency: String, remoteIP: String, stderr: String) {
+        var args = [
+            "-u", "ALL_PROXY",
+            "-u", "all_proxy",
+            "-u", "HTTPS_PROXY",
+            "-u", "https_proxy",
+            "-u", "HTTP_PROXY",
+            "-u", "http_proxy",
+            "-u", "NO_PROXY",
+            "-u", "no_proxy",
+            "/usr/bin/curl",
+            "-sS",
+            "-o", "/dev/null",
+            "-w", "%{http_code}|%{time_total}|%{remote_ip}",
+            "--max-time", "8"
+        ]
+        if let proxyURL {
+            args.append(contentsOf: ["--proxy", proxyURL])
+        }
+        args.append("https://www.google.com")
+
+        let result = await CommandRunner.run("/usr/bin/env", args)
         let parts = result.stdout.components(separatedBy: "|")
         let code = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let latency = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
         let remoteIP = parts.count > 2 ? parts[2].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+        return (code, latency, remoteIP, result.stderr)
+    }
 
-        externalResult.statusCode = code
-        externalResult.accessible = (code == "200" || code == "301" || code == "302")
+    private func externalCodeIsAccessible(_ code: String) -> Bool {
+        ["200", "301", "302"].contains(code)
+    }
 
-        if let ms = Double(latency) {
+    func checkExternalNetwork() async {
+        await refreshStatus()
+        let host = proxyHost.isEmpty ? "127.0.0.1" : proxyHost
+        let proxyURL = "http://\(host):\(clashPort)"
+        log("检测外部网络: google.com（通过 \(proxyURL)）...")
+        externalResult.url = "https://www.google.com"
+
+        var result = await externalCurl(proxyURL: proxyURL)
+        var usedProxy = true
+        if !externalCodeIsAccessible(result.code) {
+            let directResult = await externalCurl(proxyURL: nil)
+            if externalCodeIsAccessible(directResult.code) {
+                result = directResult
+                usedProxy = false
+            }
+        }
+
+        externalResult.statusCode = result.code
+        externalResult.accessible = externalCodeIsAccessible(result.code)
+
+        if let ms = Double(result.latency) {
             externalResult.latencyMs = String(format: "%.0fms", ms * 1000)
         } else {
-            externalResult.latencyMs = latency
+            externalResult.latencyMs = result.latency
         }
 
         if externalResult.accessible {
-            log("外部网络可访问: google.com → HTTP \(code) (\(externalResult.latencyMs)) 出口IP: \(remoteIP) ✓", .success)
+            let mode = usedProxy ? "代理 \(proxyURL)" : "直接连接"
+            log("外部网络可访问: google.com → HTTP \(result.code) (\(externalResult.latencyMs)) 出口IP: \(result.remoteIP) [\(mode)] ✓", .success)
         } else {
-            log("外部网络不可访问: HTTP \(code) (\(externalResult.latencyMs))", .error)
+            let errorDetail = result.stderr.isEmpty ? "" : "，错误: \(result.stderr)"
+            log("外部网络不可访问: HTTP \(result.code) (\(externalResult.latencyMs))\(errorDetail)", .error)
             // Add diagnostic for external failure
             let proxyCheck = await CommandRunner.runShell("scutil --proxy 2>/dev/null | grep -E 'HTTPEnable|HTTPProxy|HTTPPort'")
             if !proxyCheck.stdout.isEmpty {
@@ -693,5 +1697,52 @@ final class ProxyService {
             internalResult.statusCode = "-"
             log("公司内网不可访问: \(domain) 及子域均无法解析，请确认 SASE 已连接", .error)
         }
+    }
+}
+
+enum KeychainStore {
+    private static let service = "MergeSASE"
+
+    static func read(key: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data
+        else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func write(_ value: String, key: String) -> Bool {
+        let data = Data(value.utf8)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key
+        ]
+        let update: [String: Any] = [kSecValueData as String: data]
+        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if status == errSecSuccess { return true }
+        if status != errSecItemNotFound { return false }
+
+        var add = query
+        add[kSecValueData as String] = data
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func delete(key: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 }

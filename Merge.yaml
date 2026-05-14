@@ -4,8 +4,13 @@ profile:
 
 dns:
   use-system-hosts: false
+  fake-ip-filter-mode: blacklist
   fake-ip-filter:
-    - '+.company.internal'
+    - '+.cds8.cn'
+    - '+.limayao.com'
+  nameserver-policy:
+    '+.cds8.cn': system
+    '+.limayao.com': system
 
 tun:
   enable: true
@@ -14,9 +19,11 @@ tun:
     - '10.0.0.0/8'
     - '172.16.0.0/12'
     - '192.168.0.0/16'
-    - '10.0.0.0/8'
+    - '197.19.0.0/16'
+    - '198.18.0.0/16'
   route-exclude:
     - '10.0.0.0/8'
     - '172.16.0.0/12'
     - '192.168.0.0/16'
-    - '10.0.0.0/8'
+    - '197.19.0.0/16'
+    - '198.18.0.0/16'

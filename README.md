@@ -11,6 +11,8 @@ xattr -cr（把app直接拖到终端里）
 
 # MergeSASE
 
+> 注意：`ai-platform-cicada-llm-api.limayao.com` 解析到 SASE 内网地址，ccswitch/Codex 等应用需要直连它。MergeSASE 会把这个精确 host 写进 `NO_PROXY/no_proxy`，并清理 `ALL_PROXY/all_proxy`，避免内网请求被强制兜底送入 Clash。
+
 ## 快速开始
 
 ### 方式一：MergeSASE.app（推荐）
@@ -18,6 +20,8 @@ xattr -cr（把app直接拖到终端里）
 双击 `MergeSASE.app` → 点击「一键启动」。
 
 - 自动检测 Clash 端口、配置路由排除、设置系统代理、部署守护、重启 Chrome
+- 修复 Codex/ccswitch/Claude Code 等应用级代理环境：公网继续走 Clash，公司 LLM API 直连 SASE
+- 运行态识别 `verge-mihomo` / Clash Verge service，避免 Clash 实际运行但界面误报“未运行”
 - 实时状态监控、网络连通性检测、域名管理、日志查看
 
 ### 方式二：命令行

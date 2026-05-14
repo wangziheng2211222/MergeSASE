@@ -56,8 +56,14 @@ CLASH_HOST="127.0.0.1"
 
 # ---- 公司内部域名（按需添加）----
 COMPANY_DOMAINS=(
-    "company.internal"
+    "cds8.cn"
+    "limayao.com"
 )
+DIRECT_COMPANY_HOSTS=(
+    "ai.limayao.com"
+    "ai-platform-cicada-llm-api.limayao.com"
+)
+PROXY_REQUIRED_HOSTS=()
 # ---- 还可以在这里继续添加，例如: "company.com" "internal.corp" ----
 
 GUARD_SCRIPT="$HOME/.local/bin/clash-proxy-guard.sh"
@@ -72,20 +78,34 @@ log "检测到 Clash 代理端口: ${CLASH_HOST}:${CLASH_PORT}"
 
 # ---------- 1. 写入守护脚本 ----------
 mkdir -p "$(dirname "$GUARD_SCRIPT")"
-cat > "$GUARD_SCRIPT" << 'SCRIPT_EOF'
+DOMAIN_LINES=""
+for d in "${COMPANY_DOMAINS[@]}"; do
+    DOMAIN_LINES+="    \"$d\""$'\n'
+done
+DIRECT_HOST_LINES=""
+for d in "${DIRECT_COMPANY_HOSTS[@]}"; do
+    DIRECT_HOST_LINES+="    \"$d\""$'\n'
+done
+PROXY_REQUIRED_LINES=""
+for d in "${PROXY_REQUIRED_HOSTS[@]}"; do
+    PROXY_REQUIRED_LINES+="    \"$d\""$'\n'
+done
+
+cat > "$GUARD_SCRIPT" << SCRIPT_EOF
 #!/bin/bash
 # --- Clash Proxy Guard (auto-generated) ---
-CLASH_HOST="__CLASH_HOST__"
-CLASH_PORT="__CLASH_PORT__"
+CLASH_HOST="${CLASH_HOST}"
+CLASH_PORT="${CLASH_PORT}"
 
 COMPANY_DOMAINS=(
-__COMPANY_DOMAINS__
+${DOMAIN_LINES}
 )
-
-current_host=$(scutil --proxy 2>/dev/null | grep HTTPProxy | awk '{print $3}')
-if [ "$current_host" = "$CLASH_HOST" ]; then
-    exit 0
-fi
+DIRECT_COMPANY_HOSTS=(
+${DIRECT_HOST_LINES}
+)
+PROXY_REQUIRED_HOSTS=(
+${PROXY_REQUIRED_LINES}
+)
 
 BYPASS=(
     "127.0.0.1"
@@ -95,26 +115,23 @@ BYPASS=(
     "10.0.0.0/8"
     "172.16.0.0/12"
     "192.168.0.0/16"
-    "\${COMPANY_DOMAINS[@]}"
+    "197.19.0.0/16"
+    "cds8.cn"
+    "*.cds8.cn"
+    "limayao.com"
+    "*.limayao.com"
+    "\${DIRECT_COMPANY_HOSTS[@]}"
 )
 
-for service in $(networksetup -listallnetworkservices 2>/dev/null | tail -n +2); do
-    networksetup -setwebproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null
-    networksetup -setsecurewebproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null
-    networksetup -setsocksfirewallproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null
-    networksetup -setproxybypassdomains "$service" "\${BYPASS[@]}" 2>/dev/null
-done
+while IFS= read -r service; do
+    [ -z "\$service" ] && continue
+    case "\$service" in \\**) continue ;; esac
+    networksetup -setwebproxy "\$service" "\$CLASH_HOST" "\$CLASH_PORT" 2>/dev/null || true
+    networksetup -setsecurewebproxy "\$service" "\$CLASH_HOST" "\$CLASH_PORT" 2>/dev/null || true
+    networksetup -setsocksfirewallproxy "\$service" "\$CLASH_HOST" "\$CLASH_PORT" 2>/dev/null || true
+    networksetup -setproxybypassdomains "\$service" "\${BYPASS[@]}" 2>/dev/null || true
+done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
 SCRIPT_EOF
-
-sed -i '' "s/__CLASH_HOST__/${CLASH_HOST}/g" "$GUARD_SCRIPT"
-sed -i '' "s/__CLASH_PORT__/${CLASH_PORT}/g" "$GUARD_SCRIPT"
-
-# 写入公司域名列表
-DOMAIN_LINES=""
-for d in "${COMPANY_DOMAINS[@]}"; do
-    DOMAIN_LINES+="    \"$d\""$'\n'
-done
-sed -i '' "s/__COMPANY_DOMAINS__/${DOMAIN_LINES}/g" "$GUARD_SCRIPT"
 
 chmod +x "$GUARD_SCRIPT"
 log "守护脚本已写入: $GUARD_SCRIPT"
@@ -152,17 +169,31 @@ log "launchd 配置已写入: $PLIST_PATH"
 # ---------- 3. 立即设置代理 ----------
 BYPASS_ARGS=(
     "127.0.0.1" "localhost" "*.local" "169.254.0.0/16"
-    "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16"
-    "${COMPANY_DOMAINS[@]}"
+    "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "197.19.0.0/16"
+    "cds8.cn" "*.cds8.cn" "limayao.com" "*.limayao.com" "${DIRECT_COMPANY_HOSTS[@]}"
 )
 
-for service in $(networksetup -listallnetworkservices 2>/dev/null | tail -n +2); do
+while IFS= read -r service; do
+    [ -z "$service" ] && continue
+    case "$service" in \**) continue ;; esac
     networksetup -setwebproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null || true
     networksetup -setsecurewebproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null || true
     networksetup -setsocksfirewallproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null || true
     networksetup -setproxybypassdomains "$service" "${BYPASS_ARGS[@]}" 2>/dev/null || true
-done
+done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
 log "系统代理已设置为 ${CLASH_HOST}:${CLASH_PORT}"
+
+# ccswitch 等非浏览器应用通常读取 launchd 环境变量。
+# 额外写入精确 API host，兼容不识别 *.limayao.com 的客户端。
+PROXY_URL="http://${CLASH_HOST}:${CLASH_PORT}"
+NO_PROXY_VALUE="localhost,127.0.0.1,::1,.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,197.19.0.0/16,cds8.cn,.cds8.cn,*.cds8.cn,limayao.com,.limayao.com,*.limayao.com,ai.limayao.com,ai-platform-cicada-llm-api.limayao.com"
+for key in HTTP_PROXY http_proxy HTTPS_PROXY https_proxy; do
+    launchctl setenv "$key" "$PROXY_URL"
+done
+for key in NO_PROXY no_proxy; do
+    launchctl setenv "$key" "$NO_PROXY_VALUE"
+done
+log "应用代理环境已设置；ccswitch 重启后会直连 SASE 访问 LLM API"
 
 # ---------- 4. 加载 launchd ----------
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
