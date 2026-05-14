@@ -27,6 +27,19 @@ xattr -cr（把app直接拖到终端里）
 bash clash-sase-fix.command
 ```
 
+## 余额查询原理
+
+MergeSASE 的余额查询不会在仓库里写死账号、密码或真实 Cookie。它的流程是：
+
+1. 点击授权后，App 内嵌 WebView 打开开发者后台登录页，例如 `https://developer.company.internal/auth/login`。
+2. 用户在网页里扫码或登录完成后，App 只读取该站点下名为 `session_id` 的 Cookie。
+3. 读取到的登录态会保存到 macOS Keychain，后续查询时从 Keychain 取出，不写入源码、配置文件或日志。
+4. 刷新余额时，App 向开发者面板接口发起 `GET /api/user/developer-dashboard`，并把登录态作为 `Cookie: session_id=...` 带上。
+5. 接口返回 JSON 后，App 优先解析 `stats_cards` 里的当前余额、历史消耗、请求次数、Token 用量等字段，并在菜单栏展示摘要。
+6. 如果接口返回 401/403，App 会提示重新授权；开启自动刷新时，每 60 秒用同一套 Keychain 登录态重新查询一次。
+
+文档里的 `developer.company.internal` 和 `api.company.internal` 都是占位域名。实际使用时，请在本地应用里配置自己的公司域名，不要把真实域名、Cookie 或 session 值提交到 Git。
+
 ## 问题背景
 
 SASE VPN 创建虚拟网卡接管 DNS 和路由表，Clash 也需要 TUN 模式劫持流量，两者同时开启产生多层冲突：
