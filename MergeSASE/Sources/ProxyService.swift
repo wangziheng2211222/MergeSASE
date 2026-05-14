@@ -84,7 +84,7 @@ final class ProxyService {
     var developerCredential: String = ""
     var developerBalanceStatus: DeveloperBalanceStatus = .unconfigured
     var developerBalanceSummary: String = "未配置"
-    var developerBalanceDetail: String = "粘贴 ai.limayao.com 登录后的 session_id 或 Cookie"
+    var developerBalanceDetail: String = "粘贴 developer.company.internal 登录后的 session_id 或 Cookie"
     var developerBalanceLastChecked: Date?
     var developerBalanceFields: [BalanceField] = []
     var developerBalanceDeltaText: String = ""
@@ -140,8 +140,8 @@ final class ProxyService {
     }
 
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-    private let developerBalanceURL = URL(string: "https://ai.limayao.com/api/user/developer-dashboard")!
-    private let developerCredentialKey = "ai.limayao.com.session"
+    private let developerBalanceURL = URL(string: "https://developer.company.internal/api/user/developer-dashboard")!
+    private let developerCredentialKey = "developer.company.internal.session"
     private let developerLastBalanceKey = "developerLastBalanceAmount"
     private let developerLastRequestCountKey = "developerLastRequestCount"
     private var backupDir: String { "\(homeDir)/Library/Application Support/MergeSASE/Backup" }
@@ -151,7 +151,7 @@ final class ProxyService {
     private let managedNoProxyKeys = ["NO_PROXY", "no_proxy"]
     private var managedEnvKeys: [String] { managedProxyKeys + managedAllProxyKeys + managedNoProxyKeys }
     private let proxyRequiredHosts: [String] = []
-    private let directCompanyHosts = ["ai.limayao.com", "ai-platform-cicada-llm-api.limayao.com"]
+    private let directCompanyHosts = ["developer.company.internal", "api.company.internal"]
     private var startupNetworkCheckCompleted = false
     private var developerAutoRefreshTimer: Timer?
     private static let shortTimeFormatter: DateFormatter = {
@@ -163,8 +163,8 @@ final class ProxyService {
     init() {
         let saved = UserDefaults.standard.stringArray(forKey: "companyDomains") ?? []
         // Migrate from old default or bootstrap
-        if saved.isEmpty || saved == ["company.internal"] {
-            self.companyDomains = ["cds8.cn", "limayao.com"]
+        if saved.isEmpty {
+            self.companyDomains = ["company.internal"]
             UserDefaults.standard.removeObject(forKey: "companyDomains") // let didSet write fresh value
         } else {
             self.companyDomains = saved
@@ -392,7 +392,7 @@ final class ProxyService {
         do {
             try (kept.joined(separator: "\n") + block + "\n").write(toFile: codexEnvPath, atomically: true, encoding: .utf8)
             appEnvFixed = true
-            log("Codex/应用代理环境已修复: limayao 与 SASE 网段直连，公网仍走 Clash", .success)
+            log("Codex/应用代理环境已修复: 公司域名与 SASE 网段直连，公网仍走 Clash", .success)
         } catch {
             appEnvFixed = false
             log("Codex/应用代理环境写入失败: \(error.localizedDescription)", .warn)
@@ -521,7 +521,7 @@ final class ProxyService {
 
     func removeDomain(_ domain: String) {
         companyDomains.removeAll { $0 == domain }
-        if companyDomains.isEmpty { companyDomains = ["cds8.cn", "limayao.com"] }
+        if companyDomains.isEmpty { companyDomains = ["company.internal"] }
     }
 
     // MARK: - Developer Balance
@@ -533,7 +533,7 @@ final class ProxyService {
             KeychainStore.delete(key: developerCredentialKey)
             developerBalanceStatus = .unconfigured
             developerBalanceSummary = "未配置"
-            developerBalanceDetail = "粘贴 ai.limayao.com 登录后的 session_id 或 Cookie"
+            developerBalanceDetail = "粘贴 developer.company.internal 登录后的 session_id 或 Cookie"
             developerBalanceFields = []
             developerBalanceDeltaText = ""
             developerBalanceAmount = nil
@@ -1458,7 +1458,7 @@ final class ProxyService {
 
         let codexEnvPath = "\(homeDir)/.codex/.env"
         if let content = try? String(contentsOfFile: codexEnvPath, encoding: .utf8) {
-            appEnvFixed = content.contains("limayao.com")
+            appEnvFixed = content.contains("company.internal")
                 && content.contains("197.19.0.0/16")
                 && content.contains("unset ALL_PROXY")
                 && content.contains("export no_proxy=$NO_PROXY")

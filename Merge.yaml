@@ -6,11 +6,9 @@ dns:
   use-system-hosts: false
   fake-ip-filter-mode: blacklist
   fake-ip-filter:
-    - '+.cds8.cn'
-    - '+.limayao.com'
+    - '+.company.internal'
   nameserver-policy:
-    '+.cds8.cn': system
-    '+.limayao.com': system
+    '+.company.internal': system
 
 tun:
   enable: true

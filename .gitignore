@@ -1,6 +1,7 @@
 .DS_Store
 .build/
 *.app
+*.zip
 图标.png
 
 # macOS

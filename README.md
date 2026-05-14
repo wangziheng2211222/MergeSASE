@@ -1,7 +1,6 @@
+# MergeSASE
 
-[MergeSASE.zip](https://github.com/user-attachments/files/27744588/MergeSASE.zip)
-
-最新更新v1.1：修复claudecode无法走公司内网的问题。
+最新更新 v1.1：改进 Codex/ccswitch/Claude Code 等应用访问公司内网 API 的代理绕过逻辑。
 
 **遇到损坏无法打开，终端执行**
 xattr -cr（把app直接拖到终端里）
@@ -9,9 +8,7 @@ xattr -cr（把app直接拖到终端里）
 
 注意想要让自己的公司内部网络生效需要在公司域名那边添加下自己公司的域名，xxxx.com
 
-# MergeSASE
-
-> 注意：`ai-platform-cicada-llm-api.limayao.com` 解析到 SASE 内网地址，ccswitch/Codex 等应用需要直连它。MergeSASE 会把这个精确 host 写进 `NO_PROXY/no_proxy`，并清理 `ALL_PROXY/all_proxy`，避免内网请求被强制兜底送入 Clash。
+> 注意：`api.company.internal` 解析到 SASE 内网地址，ccswitch/Codex 等应用需要直连它。MergeSASE 会把这个精确 host 写进 `NO_PROXY/no_proxy`，并清理 `ALL_PROXY/all_proxy`，避免内网请求被强制兜底送入 Clash。
 
 ## 快速开始
 

@@ -672,7 +672,7 @@ struct DeveloperLoginSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Text("登录 ai.limayao.com")
+                Text("登录 developer.company.internal")
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 Text("扫码完成后会自动关闭")
@@ -702,7 +702,7 @@ struct DeveloperLoginWebView: NSViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView
-        webView.load(URLRequest(url: URL(string: "https://ai.limayao.com/auth/login")!))
+        webView.load(URLRequest(url: URL(string: "https://developer.company.internal/auth/login")!))
         context.coordinator.startPolling()
         return webView
     }
@@ -743,7 +743,7 @@ struct DeveloperLoginWebView: NSViewRepresentable {
             webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
                 guard let self, !self.didCaptureSession else { return }
                 guard let cookie = cookies.first(where: {
-                    $0.name == "session_id" && $0.domain.contains("ai.limayao.com")
+                    $0.name == "session_id" && $0.domain.contains("developer.company.internal")
                 }) else {
                     return
                 }
