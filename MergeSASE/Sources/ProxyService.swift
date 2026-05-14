@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import Security
 
 enum AppPhase: String { case idle, starting, running, stopping, error }
 
@@ -81,10 +80,13 @@ final class ProxyService {
     }
     var statusMessage: String = "就绪"
     var newDomain: String = ""
+    var developerBaseAddress: String = "" {
+        didSet { UserDefaults.standard.set(developerBaseAddress, forKey: developerBaseAddressKey) }
+    }
     var developerCredential: String = ""
     var developerBalanceStatus: DeveloperBalanceStatus = .unconfigured
     var developerBalanceSummary: String = "未配置"
-    var developerBalanceDetail: String = "粘贴 developer.company.internal 登录后的 session_id 或 Cookie"
+    var developerBalanceDetail: String = "配置开发者后台地址后即可授权登录"
     var developerBalanceLastChecked: Date?
     var developerBalanceFields: [BalanceField] = []
     var developerBalanceDeltaText: String = ""
@@ -138,10 +140,18 @@ final class ProxyService {
             return "creditcard"
         }
     }
+    var developerAddressDisplay: String {
+        developerBaseAddress.isEmpty ? "未配置" : developerBaseAddress
+    }
+    var developerLoginURL: URL? {
+        developerEndpointURL(path: "/auth/login")
+    }
+    var developerCookieHost: String? {
+        developerBaseURL?.host
+    }
 
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-    private let developerBalanceURL = URL(string: "https://developer.company.internal/api/user/developer-dashboard")!
-    private let developerCredentialKey = "developer.company.internal.session"
+    private let developerBaseAddressKey = "developerBaseAddress"
     private let developerLastBalanceKey = "developerLastBalanceAmount"
     private let developerLastRequestCountKey = "developerLastRequestCount"
     private var backupDir: String { "\(homeDir)/Library/Application Support/MergeSASE/Backup" }
@@ -151,7 +161,13 @@ final class ProxyService {
     private let managedNoProxyKeys = ["NO_PROXY", "no_proxy"]
     private var managedEnvKeys: [String] { managedProxyKeys + managedAllProxyKeys + managedNoProxyKeys }
     private let proxyRequiredHosts: [String] = []
-    private let directCompanyHosts = ["developer.company.internal", "api.company.internal"]
+    private var directCompanyHosts: [String] {
+        var hosts = ["developer.company.internal", "api.company.internal"]
+        if let host = developerCookieHost, !hosts.contains(host) {
+            hosts.append(host)
+        }
+        return hosts
+    }
     private var startupNetworkCheckCompleted = false
     private var developerAutoRefreshTimer: Timer?
     private static let shortTimeFormatter: DateFormatter = {
@@ -169,6 +185,7 @@ final class ProxyService {
         } else {
             self.companyDomains = saved
         }
+        self.developerBaseAddress = UserDefaults.standard.string(forKey: developerBaseAddressKey) ?? ""
         if UserDefaults.standard.object(forKey: "developerAutoRefreshDefaultedV2") == nil {
             self.developerAutoRefreshEnabled = true
             UserDefaults.standard.set(true, forKey: "developerAutoRefreshDefaultedV2")
@@ -176,23 +193,11 @@ final class ProxyService {
         } else {
             self.developerAutoRefreshEnabled = UserDefaults.standard.bool(forKey: "developerAutoRefreshEnabled")
         }
-        if UserDefaults.standard.object(forKey: developerLastBalanceKey) != nil {
-            self.developerBalanceAmount = UserDefaults.standard.double(forKey: developerLastBalanceKey)
-        }
-        if UserDefaults.standard.object(forKey: developerLastRequestCountKey) != nil {
-            self.developerRequestCount = UserDefaults.standard.double(forKey: developerLastRequestCountKey)
-        }
-        self.developerCredential = KeychainStore.read(key: developerCredentialKey) ?? ""
-        if !developerCredential.isEmpty {
-            developerBalanceSummary = "可刷新"
-            developerBalanceDetail = "已保存登录态，点击刷新读取当前额度"
-        }
+        UserDefaults.standard.removeObject(forKey: developerLastBalanceKey)
+        UserDefaults.standard.removeObject(forKey: developerLastRequestCountKey)
         configureDeveloperAutoRefreshTimer()
         Task {
             await refreshStatus()
-            if !developerCredential.isEmpty {
-                await refreshDeveloperBalance()
-            }
         }
     }
 
@@ -530,10 +535,9 @@ final class ProxyService {
         let value = developerCredential.trimmingCharacters(in: .whitespacesAndNewlines)
         developerCredential = value
         if value.isEmpty {
-            KeychainStore.delete(key: developerCredentialKey)
             developerBalanceStatus = .unconfigured
             developerBalanceSummary = "未配置"
-            developerBalanceDetail = "粘贴 developer.company.internal 登录后的 session_id 或 Cookie"
+            developerBalanceDetail = "授权后即可读取开发者余额"
             developerBalanceFields = []
             developerBalanceDeltaText = ""
             developerBalanceAmount = nil
@@ -542,17 +546,28 @@ final class ProxyService {
             UserDefaults.standard.removeObject(forKey: developerLastRequestCountKey)
             configureDeveloperAutoRefreshTimer()
             log("开发者余额登录态已清除", .info)
-        } else if KeychainStore.write(value, key: developerCredentialKey) {
-            developerBalanceSummary = "已保存"
-            developerBalanceDetail = "点击刷新读取当前额度"
-            configureDeveloperAutoRefreshTimer()
-            log("开发者余额登录态已保存到 Keychain", .success)
         } else {
-            developerBalanceStatus = .error
-            developerBalanceSummary = "保存失败"
-            developerBalanceDetail = "Keychain 写入失败"
-            log("开发者余额登录态保存失败", .error)
+            developerBalanceSummary = "已授权"
+            developerBalanceDetail = "登录态仅在本次运行内保存，点击刷新读取当前额度"
+            configureDeveloperAutoRefreshTimer()
+            log("开发者余额登录态已临时保存", .success)
         }
+    }
+
+    @discardableResult
+    func saveDeveloperBaseAddress(_ value: String) -> Bool {
+        guard let normalized = normalizedDeveloperBaseAddress(value) else {
+            developerBaseAddress = ""
+            developerBalanceStatus = .unconfigured
+            developerBalanceSummary = "填地址"
+            developerBalanceDetail = "请先输入开发者后台地址"
+            log("开发者后台地址未配置或无效", .warn)
+            return false
+        }
+        developerBaseAddress = normalized
+        developerBalanceDetail = developerCredential.isEmpty ? "已配置地址，下一步授权登录" : "本次运行已授权，点击刷新读取当前额度"
+        log("开发者后台地址已保存: \(normalized)", .success)
+        return true
     }
 
     func saveDeveloperCredential(_ value: String) {
@@ -581,6 +596,15 @@ final class ProxyService {
     }
 
     func refreshDeveloperBalance() async {
+        guard let developerBalanceURL = developerEndpointURL(path: "/api/user/developer-dashboard") else {
+            developerBalanceStatus = .unconfigured
+            developerBalanceSummary = "填地址"
+            developerBalanceDetail = "请先输入开发者后台地址"
+            developerBalanceDeltaText = ""
+            log("开发者余额未配置后台地址", .warn)
+            return
+        }
+
         let credential = developerCredential.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !credential.isEmpty else {
             developerBalanceStatus = .unconfigured
@@ -626,7 +650,14 @@ final class ProxyService {
                 return
             }
 
-            let parsed = parseBalanceResponse(data)
+            var parsed = parseBalanceResponse(data)
+            if let quotaBalance = await fetchDeveloperModelQuotaBalance(credential: credential) {
+                parsed.summary = quotaBalance.display
+                parsed.amount = quotaBalance.amount
+                parsed.fields = parsed.fields.map { field in
+                    field.key == "当前余额" ? BalanceField(key: field.key, value: quotaBalance.display) : field
+                }
+            }
             developerBalanceStatus = .ok
             developerBalanceSummary = parsed.summary
             developerBalanceDetail = parsed.detail
@@ -643,24 +674,19 @@ final class ProxyService {
     }
 
     private func updateBalanceChange(newAmount: Double?, requestCount: Double?) {
-        if let requestCount {
-            if let oldCount = developerRequestCount {
-                let diff = requestCount - oldCount
-                if abs(diff) >= 0.5 {
-                    developerBalanceDeltaText = "相比上次 -\(formatCount(abs(diff)))"
-                } else {
-                    developerBalanceDeltaText = "相比上次 -0.0"
-                }
-            } else {
-                developerBalanceDeltaText = "相比上次 -0.0"
-            }
-            developerRequestCount = requestCount
-            UserDefaults.standard.set(requestCount, forKey: developerLastRequestCountKey)
-        }
-
         if let newAmount {
+            if let oldAmount = developerBalanceAmount {
+                developerBalanceDeltaText = formatBalanceDelta(newAmount - oldAmount)
+            } else {
+                developerBalanceDeltaText = "相比上次 $0.00"
+            }
             developerBalanceAmount = newAmount
             UserDefaults.standard.set(newAmount, forKey: developerLastBalanceKey)
+        }
+
+        if let requestCount {
+            developerRequestCount = requestCount
+            UserDefaults.standard.set(requestCount, forKey: developerLastRequestCountKey)
         }
     }
 
@@ -669,6 +695,62 @@ final class ProxyService {
             return value
         }
         return "session_id=\(value)"
+    }
+
+    private func fetchDeveloperModelQuotaBalance(credential: String) async -> (display: String, amount: Double)? {
+        guard let modelQuotaURL = developerEndpointURL(path: "/api/user/self/model_quota") else {
+            return nil
+        }
+
+        var request = URLRequest(url: modelQuotaURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 12
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.setValue(cookieHeader(from: credential), forHTTPHeaderField: "Cookie")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("MergeSASE/1.0", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(statusCode) else { return nil }
+            return parseModelQuotaBalance(data)
+        } catch {
+            return nil
+        }
+    }
+
+    private var developerBaseURL: URL? {
+        guard let normalized = normalizedDeveloperBaseAddress(developerBaseAddress) else { return nil }
+        return URL(string: normalized)
+    }
+
+    private func developerEndpointURL(path: String) -> URL? {
+        guard let baseURL = developerBaseURL else { return nil }
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.path = "/\(path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))"
+        return components?.url
+    }
+
+    private func normalizedDeveloperBaseAddress(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let withScheme = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        guard
+            var components = URLComponents(string: withScheme),
+            let host = components.host?.lowercased(),
+            !host.isEmpty,
+            host != "developer.company.internal",
+            host != "api.company.internal"
+        else {
+            return nil
+        }
+        components.scheme = components.scheme?.lowercased() ?? "https"
+        components.host = host
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        return components.url?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     private func parseBalanceResponse(_ data: Data) -> (summary: String, detail: String, fields: [BalanceField], amount: Double?, requestCount: Double?) {
@@ -696,6 +778,45 @@ final class ProxyService {
         }
 
         return ("已返回", compactResponseText(data), [], nil, nil)
+    }
+
+    private func parseModelQuotaBalance(_ data: Data) -> (display: String, amount: Double)? {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let root = object as? [String: Any]
+        else {
+            return nil
+        }
+
+        if
+            let overview = root["monthly_overview"] as? [String: Any],
+            let remainingQuota = numberValue(overview["display_remaining_quota"])
+        {
+            return (formatQuotaBalance(remainingQuota), remainingQuota / 500_000)
+        }
+
+        guard let groups = root["data"] as? [[String: Any]] else {
+            return nil
+        }
+        let monthlyGroups = groups.filter {
+            ($0["period"] as? String) == "monthly" && Int(numberValue($0["max_quota_type"]) ?? 0) == 0
+        }
+        guard !monthlyGroups.isEmpty else { return nil }
+
+        let starGroups = monthlyGroups.filter {
+            (($0["models"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines) == "*"
+        }
+        let source = starGroups.isEmpty ? monthlyGroups : starGroups
+        if source.contains(where: { (numberValue($0["max_quota"]) ?? 0) <= 0 }) {
+            return ("不限", 0)
+        }
+
+        let remainingQuota = source.reduce(0) { partial, group in
+            let maxQuota = max(0, numberValue(group["max_quota"]) ?? 0)
+            let usedQuota = max(0, numberValue(group["used_quota"]) ?? 0)
+            return partial + max(0, maxQuota - usedQuota)
+        }
+        return (formatQuotaBalance(remainingQuota), remainingQuota / 500_000)
     }
 
     private func parseDashboardStats(_ object: Any) -> (summary: String, detail: String, fields: [BalanceField], amount: Double?, requestCount: Double?)? {
@@ -743,15 +864,6 @@ final class ProxyService {
             }
         }
 
-        var currentAmount: Double?
-        if let current = numericValues["current_balance"], let periodCost = numericValues["statistics_quota"] {
-            currentAmount = current + periodCost
-            values["current_balance"] = BalanceField(
-                key: "当前余额",
-                value: formatCurrentBalance(current + periodCost)
-            )
-        }
-
         let fields = preferredKeys.compactMap { values[$0] }
         guard let current = values["current_balance"], !fields.isEmpty else {
             return nil
@@ -761,34 +873,48 @@ final class ProxyService {
             .dropFirst()
             .map { "\($0.key): \($0.value)" }
             .joined(separator: " · ")
-        return (current.value, detail, fields, currentAmount ?? currencyAmount(from: current.value), numericValues["request_count"])
+        return (current.value, detail, fields, currencyAmount(from: current.value) ?? numericValues["current_balance"], numericValues["request_count"])
     }
 
     private func currencyAmount(from value: String) -> Double? {
-        let cleaned = value
-            .replacingOccurrences(of: "$", with: "")
-            .replacingOccurrences(of: ",", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return Double(cleaned)
+        let cleaned = value.replacingOccurrences(of: ",", with: "")
+        if let match = cleaned.firstMatch(of: /[-+]?\d+(?:\.\d+)?/) {
+            return Double(String(match.output))
+        }
+        return nil
+    }
+
+    private func numberValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = value as? String {
+            return Double(string)
+        }
+        return nil
     }
 
     private func formatCurrentBalance(_ value: Double) -> String {
-        let whole = floor(value)
-        return "$\(Int(whole))"
+        "$\(String(format: "%.2f", value))"
+    }
+
+    private func formatQuotaBalance(_ quota: Double) -> String {
+        let value = quota / 500_000
+        guard value.isFinite else { return "$0.00" }
+        return "$\(String(format: "%.2f", value))"
     }
 
     private func formatMenuBarBalance(_ value: Double) -> String {
         formatCurrentBalance(value)
     }
 
-    private func formatCount(_ value: Double) -> String {
-        if value >= 1_000_000 {
-            return "\(String(format: "%.1f", value / 1_000_000))M"
+    private func formatBalanceDelta(_ value: Double) -> String {
+        let normalized = abs(value) < 0.005 ? 0 : value
+        guard normalized != 0 else {
+            return "相比上次 $0.00"
         }
-        if value >= 1_000 {
-            return "\(String(format: "%.1f", value / 1_000))K"
-        }
-        return "\(Int(value.rounded()))"
+        let sign = normalized > 0 ? "+" : "-"
+        return "相比上次 \(sign)\(formatCurrentBalance(abs(normalized)))"
     }
 
     private func isBalanceLikeKey(_ key: String) -> Bool {
@@ -1697,52 +1823,5 @@ final class ProxyService {
             internalResult.statusCode = "-"
             log("公司内网不可访问: \(domain) 及子域均无法解析，请确认 SASE 已连接", .error)
         }
-    }
-}
-
-enum KeychainStore {
-    private static let service = "MergeSASE"
-
-    static func read(key: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: key,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data
-        else {
-            return nil
-        }
-        return String(data: data, encoding: .utf8)
-    }
-
-    static func write(_ value: String, key: String) -> Bool {
-        let data = Data(value.utf8)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: key
-        ]
-        let update: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-        if status == errSecSuccess { return true }
-        if status != errSecItemNotFound { return false }
-
-        var add = query
-        add[kSecValueData as String] = data
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
-    }
-
-    static func delete(key: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: key
-        ]
-        SecItemDelete(query as CFDictionary)
     }
 }
