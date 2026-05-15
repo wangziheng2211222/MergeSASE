@@ -48,7 +48,10 @@ struct ContentView: View {
         .sheet(isPresented: $showDeveloperLogin) {
             DeveloperLoginSheet(
                 loginURL: svc.developerLoginURL,
-                cookieHost: svc.developerCookieHost
+                cookieHost: svc.developerCookieHost,
+                onClose: {
+                    showDeveloperLogin = false
+                }
             ) { sessionID in
                 svc.saveDeveloperCredential(sessionID)
                 showDeveloperLogin = false
@@ -308,17 +311,20 @@ struct ContentView: View {
             }
 
             if shouldShowDeveloperAuthorizationPrompt {
-                Button {
-                    beginDeveloperAuthorization()
-                } label: {
-                    Label(developerAuthorizationTitle, systemImage: "person.crop.circle.badge.plus")
-                        .font(.system(size: 12, weight: .semibold))
-                        .frame(maxWidth: .infinity)
-                        .frame(minHeight: 30)
+                HStack {
+                    Spacer()
+                    Button {
+                        beginDeveloperAuthorization()
+                    } label: {
+                        Label(developerAuthorizationTitle, systemImage: "person.crop.circle.badge.plus")
+                            .font(.system(size: 12, weight: .semibold))
+                            .padding(.horizontal, 8)
+                            .frame(minHeight: 26)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help(developerAuthorizationHelp)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.regular)
-                .help(developerAuthorizationHelp)
             }
 
             if showDeveloperBalance {
@@ -729,6 +735,7 @@ private let cardBg = Color(nsColor: .windowBackgroundColor)
 struct DeveloperLoginSheet: View {
     let loginURL: URL?
     let cookieHost: String?
+    let onClose: () -> Void
     let onSessionID: (String) -> Void
 
     var body: some View {
@@ -740,6 +747,17 @@ struct DeveloperLoginSheet: View {
                 Text("扫码完成后会自动关闭")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .frame(width: 20, height: 20)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+                .background(Color.primary.opacity(0.07), in: Circle())
+                .help("关闭授权页面")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
