@@ -78,6 +78,14 @@ struct RestoreSnapshot: Codable {
     var launchdEnvironment: [String: String?]?
 }
 
+enum DeveloperBalanceStatus {
+    case unconfigured
+    case loading
+    case ok
+    case error
+    case unauthorized
+}
+
 @MainActor
 @Observable
 final class ProxyService {
@@ -113,10 +121,15 @@ final class ProxyService {
     var browserSuggestion: String?
     var newDomain: String = ""
     var apiKeys: [String] {
-        didSet { UserDefaults.standard.set(apiKeys, forKey: "apiKeys") }
+        didSet {
+            UserDefaults.standard.set(apiKeys, forKey: "apiKeys")
+            scheduleDeveloperBalanceRefresh()
+        }
     }
+    var developerBalanceStatus: DeveloperBalanceStatus = .unconfigured
+    var developerBalanceSummary: String = "未配置"
     var menuBarTitle: String {
-        guardEffectivelyRunning ? "已守护" : "未启动"
+        developerBalanceSummary
     }
     var menuBarStatusText: String {
         guardEffectivelyRunning ? "代理守护已运行" : "代理守护未启动"
@@ -166,6 +179,8 @@ final class ProxyService {
         ["developer.company.internal", "api.company.internal", "ai-platform-cicada-llm-api.limayao.com"]
     }
     private var startupNetworkCheckCompleted = false
+    private let developerBalanceAPIURL = URL(string: "https://ai-platform-cicada-llm-api.limayao.com/api/usage/token/balance")!
+    private var developerBalanceRefreshTask: Task<Void, Never>?
 
     init() {
         let savedProxyPreference = UserDefaults.standard.string(forKey: "externalProxyPreference") ?? ExternalProxyPreference.auto.rawValue
@@ -179,6 +194,7 @@ final class ProxyService {
         }
         self.apiKeys = UserDefaults.standard.stringArray(forKey: "apiKeys") ?? []
         self.setupChecklistDismissed = UserDefaults.standard.bool(forKey: "setupChecklistDismissed")
+        scheduleDeveloperBalanceRefresh()
         Task {
             await refreshStatus()
         }
@@ -547,6 +563,143 @@ final class ProxyService {
         guard keys.indices.contains(index) else { return }
         keys.remove(at: index)
         apiKeys = keys.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private var activeAPIKey: String? {
+        apiKeys
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+    }
+
+    private func scheduleDeveloperBalanceRefresh() {
+        developerBalanceRefreshTask?.cancel()
+        guard let activeAPIKey else {
+            developerBalanceStatus = .unconfigured
+            developerBalanceSummary = "未配置"
+            return
+        }
+
+        developerBalanceRefreshTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
+            await refreshDeveloperBalance(with: activeAPIKey)
+        }
+    }
+
+    private func refreshDeveloperBalance(with apiKey: String) async {
+        developerBalanceStatus = .loading
+        developerBalanceSummary = "查询中…"
+
+        var request = URLRequest(url: developerBalanceAPIURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 12
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.setValue("Bearer \(bearerToken(from: apiKey))", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("MergeSASE/1.0", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard statusCode != 401 && statusCode != 403 else {
+                developerBalanceStatus = .unauthorized
+                developerBalanceSummary = "Key 无效"
+                return
+            }
+            guard (200..<300).contains(statusCode) else {
+                developerBalanceStatus = .error
+                developerBalanceSummary = "查询失败"
+                return
+            }
+
+            if let amount = parseDeveloperBalanceAmount(data) {
+                developerBalanceStatus = .ok
+                developerBalanceSummary = "$\(String(format: "%.2f", amount))"
+            } else {
+                developerBalanceStatus = .error
+                developerBalanceSummary = "查询失败"
+            }
+        } catch {
+            developerBalanceStatus = .error
+            developerBalanceSummary = "查询失败"
+        }
+    }
+
+    private func bearerToken(from value: String) -> String {
+        var token = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.lowercased().hasPrefix("authorization:") {
+            token = String(token.dropFirst("authorization:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if token.lowercased().hasPrefix("bearer ") {
+            token = String(token.dropFirst("bearer ".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return token
+    }
+
+    private func parseDeveloperBalanceAmount(_ data: Data) -> Double? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else {
+            return nil
+        }
+
+        let preferredKeys = [
+            "remaining_amount_usd",
+            "display_remaining_quota",
+            "current_balance",
+            "remaining_balance",
+            "available_balance",
+            "remaining_quota",
+            "overflow_remaining_usd",
+            "base_remaining_usd",
+            "bonus_remaining_usd",
+            "balance",
+            "quota"
+        ]
+
+        for key in preferredKeys {
+            if let amount = findNumber(forKey: key, in: object) {
+                if key == "display_remaining_quota", amount > 10_000 {
+                    return amount / 500_000
+                }
+                return amount
+            }
+        }
+        return nil
+    }
+
+    private func findNumber(forKey targetKey: String, in object: Any) -> Double? {
+        if let dict = object as? [String: Any] {
+            for (key, value) in dict {
+                if key.lowercased() == targetKey, let number = numberValue(value) {
+                    return number
+                }
+                if let number = findNumber(forKey: targetKey, in: value) {
+                    return number
+                }
+            }
+        }
+        if let array = object as? [Any] {
+            for value in array {
+                if let number = findNumber(forKey: targetKey, in: value) {
+                    return number
+                }
+            }
+        }
+        return nil
+    }
+
+    private func numberValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = value as? String {
+            let cleaned = string.replacingOccurrences(of: ",", with: "")
+            if let match = cleaned.firstMatch(of: /[-+]?\d+(?:\.\d+)?/) {
+                return Double(String(match.output))
+            }
+        }
+        return nil
     }
 
     // MARK: - Port Detection

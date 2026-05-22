@@ -357,11 +357,27 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                    HStack(alignment: .center, spacing: 12) {
+                    HStack(alignment: .center, spacing: 0) {
+                        VStack(alignment: .trailing, spacing: 5) {
+                            if svc.developerBalanceStatus == .loading {
+                                ProgressView()
+                                    .controlSize(.regular)
+                                    .tint(.blue)
+                                    .frame(width: 44, height: 36, alignment: .trailing)
+                            } else {
+                                Text(svc.developerBalanceSummary)
+                                    .font(.system(size: 30, weight: .bold))
+                                    .foregroundColor(developerBalanceColor)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.75)
+                                    .fixedSize(horizontal: true, vertical: false)
+                            }
+                        }
+
                         Image(systemName: "chevron.\(showKeyConfig ? "down" : "right")")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(.secondary.opacity(0.35))
-                            .frame(width: 32, height: 56, alignment: .center)
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundColor(.secondary.opacity(0.3))
+                            .frame(width: 12, alignment: .trailing)
                             .contentShape(Rectangle())
                     }
                 }
@@ -583,6 +599,18 @@ struct ContentView: View {
     private var phaseColor: Color {
         switch svc.phase { case .idle: .secondary; case .starting, .stopping: .orange; case .running: .green; case .error: .red }
     }
+    private var developerBalanceColor: Color {
+        switch svc.developerBalanceStatus {
+        case .ok:
+            Color(red: 0.92, green: 0.64, blue: 0.08)
+        case .error, .unauthorized:
+            .red
+        case .loading:
+            .blue
+        case .unconfigured:
+            .secondary
+        }
+    }
     private func logColor(_ level: LogLevel) -> Color {
         switch level { case .success: .green; case .warn: .orange; case .error: .red; case .info: .primary }
     }
@@ -747,17 +775,19 @@ struct SetupChecklistRow: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Button {
-                action()
-            } label: {
-                Text(buttonTitle)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(isPrimary ? .white : .blue)
-                    .frame(minWidth: isPrimary ? 76 : 62, minHeight: 28)
-                    .padding(.horizontal, 3)
-                    .background(isPrimary ? Color.blue : Color.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 6))
+            if !done {
+                Button {
+                    action()
+                } label: {
+                    Text(buttonTitle)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(isPrimary ? .white : .blue)
+                        .frame(minWidth: isPrimary ? 76 : 62, minHeight: 28)
+                        .padding(.horizontal, 3)
+                        .background(isPrimary ? Color.blue : Color.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
         .padding(.vertical, 10)
         .padding(.horizontal, 10)

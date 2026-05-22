@@ -69,11 +69,12 @@ ditto -c -k --keepParent "MergeSASE&OpenVPN.app" "../MergeSASE&OpenVPN.zip"
 
 ## 本次修复说明
 
-这次移除了开发者余额查询能力：
+这次调整开发者余额配置方式：
 
 - App 不再提供独立的「配置 Key」按钮，展开「配置 Key」区域后可以直接编辑 Key 列表。
-- App 不再请求余额接口，不再自动刷新余额，也不再显示删除 Key、刷新余额等操作。
-- 「配置 Key」区域只保存用户编辑的文本列表，不再作为余额查询授权入口。
+- App 不再显示刷新余额、删除 Key 等操作按钮。
+- 余额接口固定使用 `https://ai-platform-cicada-llm-api.limayao.com/api/usage/token/balance`，不暴露给用户配置。
+- 配置 Key 后，App 会自动读取并显示余额。
 
 文档里的 `developer.company.internal` 和 `api.company.internal` 都是占位域名。实际使用时，请在本地应用里配置自己的公司域名，不要把真实域名、Cookie、session 值或 API Key 提交到 Git。
 
