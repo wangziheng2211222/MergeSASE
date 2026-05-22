@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import WebKit
 
 struct ContentView: View {
     @Bindable var svc: ProxyService
@@ -9,9 +8,7 @@ struct ContentView: View {
     @State private var showDomainEditor = false
     @State private var showDeveloperBalance = false
     @State private var showDeveloperAdvanced = false
-    @State private var showDeveloperLogin = false
-    @State private var showDeveloperAddressSetup = false
-    @State private var loginAfterDeveloperAddressSetup = false
+    @State private var showDeveloperKeySetup = false
     @State private var balanceDropPulse = false
     @State private var lastAnimatedBalance: Double?
     @FocusState private var domainFieldFocused: Bool
@@ -45,34 +42,15 @@ struct ContentView: View {
         }
         .frame(minWidth: 280, idealWidth: 300, minHeight: 380, idealHeight: 460)
         .background(bgGray)
-        .sheet(isPresented: $showDeveloperLogin) {
-            DeveloperLoginSheet(
-                loginURL: svc.developerLoginURL,
-                cookieHost: svc.developerCookieHost,
-                onClose: {
-                    showDeveloperLogin = false
-                }
-            ) { sessionID in
-                svc.saveDeveloperCredential(sessionID)
-                showDeveloperLogin = false
+        .sheet(isPresented: $showDeveloperKeySetup) {
+            DeveloperKeySheet(
+                initialKey: svc.developerCredential
+            ) { key in
+                svc.saveDeveloperCredential(key)
+                showDeveloperKeySetup = false
                 Task { await svc.refreshDeveloperBalance() }
-            }
-        }
-        .sheet(isPresented: $showDeveloperAddressSetup) {
-            DeveloperAddressSheet(
-                initialAddress: svc.developerBaseAddress,
-                submitTitle: loginAfterDeveloperAddressSetup ? "保存并登录" : "保存"
-            ) { address in
-                let saved = svc.saveDeveloperBaseAddress(address)
-                if saved {
-                    showDeveloperAddressSetup = false
-                    if loginAfterDeveloperAddressSetup {
-                        showDeveloperLogin = true
-                    }
-                }
-                return saved
             } onCancel: {
-                showDeveloperAddressSetup = false
+                showDeveloperKeySetup = false
             }
         }
         .onAppear {
@@ -119,12 +97,7 @@ struct ContentView: View {
     }
 
     private func beginDeveloperAuthorization() {
-        if svc.developerLoginURL == nil {
-            loginAfterDeveloperAddressSetup = true
-            showDeveloperAddressSetup = true
-        } else {
-            showDeveloperLogin = true
-        }
+        showDeveloperKeySetup = true
     }
 
     // MARK: - Header
@@ -316,7 +289,7 @@ struct ContentView: View {
                     Button {
                         beginDeveloperAuthorization()
                     } label: {
-                        Label(developerAuthorizationTitle, systemImage: "person.crop.circle.badge.plus")
+                        Label(developerAuthorizationTitle, systemImage: "key.fill")
                             .font(.system(size: 12, weight: .semibold))
                             .padding(.horizontal, 8)
                             .frame(minHeight: 26)
@@ -358,7 +331,7 @@ struct ContentView: View {
                 if showDeveloperAdvanced {
                     VStack(spacing: 8) {
                         HStack(spacing: 8) {
-                            Text("后台地址")
+                            Text("余额接口")
                                 .font(.system(size: 10, weight: .medium))
                                 .foregroundColor(.secondary.opacity(0.65))
                             Text(svc.developerAddressDisplay)
@@ -367,15 +340,6 @@ struct ContentView: View {
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Spacer()
-                            Button {
-                                loginAfterDeveloperAddressSetup = false
-                                showDeveloperAddressSetup = true
-                            } label: {
-                                Image(systemName: "pencil")
-                                    .font(.system(size: 10, weight: .semibold))
-                            }
-                            .buttonStyle(.plain)
-                            .help("配置开发者后台地址")
                         }
 
                         HStack(spacing: 6) {
@@ -400,7 +364,7 @@ struct ContentView: View {
                             .buttonStyle(.borderless)
                             .controlSize(.small)
                             .help("刷新余额")
-                            .disabled(svc.developerBalanceStatus == .loading || svc.developerCredential.isEmpty || svc.developerLoginURL == nil)
+                            .disabled(svc.developerBalanceStatus == .loading || svc.developerCredential.isEmpty)
 
                             Button {
                                 svc.clearDeveloperCredential()
@@ -410,7 +374,7 @@ struct ContentView: View {
                             }
                             .buttonStyle(.borderless)
                             .controlSize(.small)
-                            .help("清除登录态")
+                            .help("清除 API Key")
                             .disabled(svc.developerCredential.isEmpty)
 
                             Toggle("自动刷新", isOn: $svc.developerAutoRefreshEnabled)
@@ -418,7 +382,7 @@ struct ContentView: View {
                                 .controlSize(.small)
                                 .font(.system(size: 9, weight: .medium))
                                 .foregroundColor(.secondary)
-                                .disabled(svc.developerCredential.isEmpty || svc.developerLoginURL == nil)
+                                .disabled(svc.developerCredential.isEmpty)
                         }
                     }
                 }
@@ -579,14 +543,11 @@ struct ContentView: View {
         case .loading:
             return "正在刷新余额数据"
         case .unauthorized:
-            return "授权已失效，需要重新登录"
+            return "API Key 无效，需要重新配置"
         case .error:
             return "刷新失败，请稍后重试"
         case .unconfigured:
-            if svc.developerLoginURL == nil {
-                return "先配置开发者后台地址"
-            }
-            return "登录后自动读取账户余额"
+            return "配置 API Key 后自动读取余额"
         }
     }
     private var developerBalanceDeltaColor: Color {
@@ -602,31 +563,30 @@ struct ContentView: View {
         [GridItem(.flexible(), spacing: 9), GridItem(.flexible(), spacing: 9)]
     }
     private var developerAuthorizationTitle: String {
-        if svc.developerLoginURL == nil { return "配置地址" }
-        if svc.developerCredential.isEmpty { return "授权登录" }
+        if svc.developerCredential.isEmpty { return "配置 Key" }
         switch svc.developerBalanceStatus {
         case .unauthorized:
-            return "重新授权"
+            return "更换 Key"
         case .error:
-            return "重新授权"
+            return "更换 Key"
         default:
-            return "已授权"
+            return "已配置"
         }
     }
     private var shouldShowDeveloperAuthorizationPrompt: Bool {
-        svc.developerLoginURL == nil || svc.developerCredential.isEmpty || svc.developerBalanceStatus == .unauthorized
+        svc.developerCredential.isEmpty || svc.developerBalanceStatus == .unauthorized
     }
     private var developerAuthorizationIcon: String? {
-        developerAuthorizationTitle == "已授权" ? nil : "qrcode.viewfinder"
+        developerAuthorizationTitle == "已配置" ? nil : "key.fill"
     }
     private var developerAuthorizationHelp: String {
         switch developerAuthorizationTitle {
-        case "已授权":
-            return "授权有效，点击可重新登录"
-        case "重新授权":
-            return "刷新失败或登录过期，请重新授权"
+        case "已配置":
+            return "API Key 已配置，点击可更换"
+        case "更换 Key":
+            return "刷新失败或 API Key 无效，请重新配置"
         default:
-            return svc.developerLoginURL == nil ? "先输入开发者后台地址" : "打开网页登录并自动获取 session_id"
+            return "输入 sk- 开头的 API Key"
         }
     }
     private func logColor(_ level: LogLevel) -> Color {
@@ -730,78 +690,32 @@ private let timeF: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH
 private let bgGray = Color(red: 0.95, green: 0.95, blue: 0.94)
 private let cardBg = Color(nsColor: .windowBackgroundColor)
 
-// MARK: - Developer Login Web View
+// MARK: - Developer Key
 
-struct DeveloperLoginSheet: View {
-    let loginURL: URL?
-    let cookieHost: String?
-    let onClose: () -> Void
-    let onSessionID: (String) -> Void
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Text("登录 \(cookieHost ?? "开发者后台")")
-                    .font(.system(size: 14, weight: .semibold))
-                Spacer()
-                Text("扫码完成后会自动关闭")
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-                Button {
-                    onClose()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 20, height: 20)
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(.secondary)
-                .background(Color.primary.opacity(0.07), in: Circle())
-                .help("关闭授权页面")
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(.regularMaterial)
-
-            if let loginURL, let cookieHost {
-                DeveloperLoginWebView(loginURL: loginURL, cookieHost: cookieHost, onSessionID: onSessionID)
-                    .frame(minWidth: 860, minHeight: 640)
-            } else {
-                Text("请先配置开发者后台地址")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.secondary)
-                    .frame(minWidth: 420, minHeight: 180)
-            }
-        }
-    }
-}
-
-struct DeveloperAddressSheet: View {
-    @State private var draftAddress: String
+struct DeveloperKeySheet: View {
+    @State private var draftKey: String
     @State private var showInvalidMessage = false
-    let submitTitle: String
-    let onSave: (String) -> Bool
+    let onSave: (String) -> Void
     let onCancel: () -> Void
 
-    init(initialAddress: String, submitTitle: String, onSave: @escaping (String) -> Bool, onCancel: @escaping () -> Void) {
-        self._draftAddress = State(initialValue: initialAddress)
-        self.submitTitle = submitTitle
+    init(initialKey: String, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+        self._draftKey = State(initialValue: initialKey)
         self.onSave = onSave
         self.onCancel = onCancel
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("配置开发者后台地址")
+            Text("配置 API Key")
                 .font(.system(size: 15, weight: .semibold))
 
-            TextField("https://developer.example.com", text: $draftAddress)
+            SecureField("sk-...", text: $draftKey)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 13))
                 .onSubmit { save() }
 
             if showInvalidMessage {
-                Text("请输入真实后台地址，不要使用占位域名。")
+                Text("请输入 API Key，支持直接粘贴 sk-... 或 Authorization: Bearer sk-...")
                     .font(.system(size: 12))
                     .foregroundColor(.red)
             }
@@ -810,7 +724,7 @@ struct DeveloperAddressSheet: View {
                 Spacer()
                 Button("取消") { onCancel() }
                     .keyboardShortcut(.cancelAction)
-                Button(submitTitle) { save() }
+                Button("保存并刷新") { save() }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
@@ -821,89 +735,12 @@ struct DeveloperAddressSheet: View {
     }
 
     private func save() {
-        let trimmed = draftAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = draftKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             showInvalidMessage = true
             return
         }
         showInvalidMessage = false
-        showInvalidMessage = !onSave(trimmed)
-    }
-}
-
-struct DeveloperLoginWebView: NSViewRepresentable {
-    let loginURL: URL
-    let cookieHost: String
-    let onSessionID: (String) -> Void
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(cookieHost: cookieHost, onSessionID: onSessionID)
-    }
-
-    func makeNSView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.navigationDelegate = context.coordinator
-        context.coordinator.webView = webView
-        webView.load(URLRequest(url: loginURL))
-        context.coordinator.startPolling()
-        return webView
-    }
-
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
-
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        let cookieHost: String
-        let onSessionID: (String) -> Void
-        weak var webView: WKWebView?
-        private var didCaptureSession = false
-        private var timer: Timer?
-
-        init(cookieHost: String, onSessionID: @escaping (String) -> Void) {
-            self.cookieHost = cookieHost.lowercased()
-            self.onSessionID = onSessionID
-        }
-
-        deinit {
-            timer?.invalidate()
-        }
-
-        func startPolling() {
-            timer?.invalidate()
-            timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-                self?.readSessionCookie()
-            }
-        }
-
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            readSessionCookie()
-        }
-
-        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-            readSessionCookie()
-        }
-
-        private func readSessionCookie() {
-            guard !didCaptureSession, let webView else { return }
-            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
-                guard let self, !self.didCaptureSession else { return }
-                guard let cookie = cookies.first(where: { cookie in
-                    cookie.name == "session_id" && self.cookie(cookie.domain, matches: self.cookieHost)
-                }) else {
-                    return
-                }
-                self.didCaptureSession = true
-                self.timer?.invalidate()
-                DispatchQueue.main.async {
-                    self.onSessionID(cookie.value)
-                }
-            }
-        }
-
-        private func cookie(_ domain: String, matches host: String) -> Bool {
-            let domain = domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
-            return domain == host || host.hasSuffix(".\(domain)") || domain.hasSuffix(".\(host)")
-        }
+        onSave(trimmed)
     }
 }

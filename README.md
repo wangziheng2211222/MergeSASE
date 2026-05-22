@@ -1,6 +1,6 @@
 # MergeSASE
 
-最新更新 v1.2：修复开发者余额显示口径、授权地址配置和登录态隐私说明。
+最新更新 v1.3：开发者余额改为 API Key 查询，不再使用网页登录授权。
 
 **遇到损坏无法打开，终端执行**
 xattr -cr（把app直接拖到终端里）
@@ -67,40 +67,37 @@ ditto -c -k --keepParent MergeSASE.app ../MergeSASE.zip
 
 ## 本次修复说明
 
-这次主要修复开发者余额与授权体验：
+这次主要调整开发者余额查询方式：
 
-- 余额主显示对齐网页 `/developer` 的最终展示口径。网页会先请求 `/api/user/developer-dashboard`，再请求 `/api/user/self/model_quota`，并用 `monthly_overview.display_remaining_quota / 500000` 覆盖当前余额；App 现在也使用这套口径。
-- 余额展示支持两位小数，例如 `$102.23`。
-- 修复“相比上次”的扣费方向，差值按最终展示余额计算，不再用请求次数推断。
-- 清理旧的本地余额缓存，避免重启后继续显示上一次缓存的 `$100.00`。
-- 点击「授权登录」前会先检查开发者后台地址；未配置时先让用户输入真实地址，不再直接打开占位域名。
-- 授权登录按钮增高，点击区域更明显。
+- 余额查询改为固定接口 `GET https://ai-platform-cicada-llm-api.limayao.com/api/usage/token/balance`。
+- 用户在 App 里配置 API Key 后，App 会用 `Authorization: Bearer <key>` 请求余额。
+- 不再打开内嵌 WebView，不再扫码登录，也不再读取 `session_id` Cookie。
+- API Key 只保存在本次 App 进程内存里，不写入 Keychain、源码、配置文件、日志或 UserDefaults。
+- 余额展示继续支持两位小数，例如 `$102.23`，并保留“相比上次”的变化提示。
 
 ## 余额查询原理
 
-MergeSASE 的余额查询不会在仓库里写死账号、密码或真实 Cookie。它的流程是：
+MergeSASE 的余额查询不会在仓库里写死账号、密码或真实 API Key。它的流程是：
 
-1. 首次点击授权时，App 会要求用户输入开发者后台地址，例如 `https://ai.example.com`。
-2. App 内嵌 WebView 打开该后台的登录页，例如 `https://ai.example.com/auth/login`。
-3. 用户在网页里扫码或登录完成后，App 只读取该站点下名为 `session_id` 的 Cookie。
-4. 读取到的登录态只保存在 App 本次运行的内存里，不写入 Keychain、源码、配置文件或日志。
-5. 刷新余额时，App 会向用户配置的后台发起两个请求：
-   - `GET /api/user/developer-dashboard`：读取请求数、历史消耗、统计额度、Token 等看板字段。
-   - `GET /api/user/self/model_quota`：读取网页实际用于覆盖“当前余额”的模型月额度字段。
-6. 如果接口返回 401/403，App 会提示重新授权；开启自动刷新时，每 60 秒用本次运行内的登录态重新查询一次。
+1. 首次点击「配置 Key」时，用户输入自己的 `sk-...` API Key。
+2. 刷新余额时，App 请求固定余额接口：
+   - `GET https://ai-platform-cicada-llm-api.limayao.com/api/usage/token/balance`
+3. App 会把用户输入的 Key 放在请求头里：
+   - `Authorization: Bearer <key>`
+4. 读取到的 API Key 只保存在 App 本次运行的内存里，不写入 Keychain、源码、配置文件、日志或 UserDefaults。
+5. 如果接口返回 401/403，App 会提示重新配置 API Key；开启自动刷新时，每 60 秒用本次运行内的 Key 重新查询一次。
 
-文档里的 `developer.company.internal` 和 `api.company.internal` 都是占位域名。实际使用时，请在本地应用里配置自己的公司域名，不要把真实域名、Cookie 或 session 值提交到 Git。
+文档里的 `developer.company.internal` 和 `api.company.internal` 都是占位域名。实际使用时，请在本地应用里配置自己的公司域名，不要把真实域名、Cookie、session 值或 API Key 提交到 Git。
 
-## 登录态和隐私
+## API Key 和隐私
 
-用户最关心的是：授权登录会不会把密钥、Cookie 或公司后台地址传给别人。当前实现遵循下面的边界：
+用户最关心的是：API Key 会不会被持久化或传给别人。当前实现遵循下面的边界：
 
-- App 不会读取 API Key 内容，也不会读取网页里的 `Authorization: Bearer sk-xxx` 示例或用户创建的密钥。
-- App 只从内嵌 WebView 的 Cookie 里读取当前配置域名下的 `session_id`，用于请求同一个后台的余额接口。
-- `session_id` 只存在当前 App 进程内存里；退出 App 后需要重新授权。
-- `session_id` 不写入 Git、不写入 README、不写入日志、不写入 Keychain、不写入 UserDefaults。
-- App 只把 `session_id` 作为 Cookie 发给用户自己配置的开发者后台域名，不会发给 GitHub、作者服务器或第三方统计服务。
-- 后台地址会保存到本机 `UserDefaults`，方便下次打开时不用重新输入；它不是登录密钥。
+- App 只在用户主动输入时读取 API Key。
+- API Key 只存在当前 App 进程内存里；退出 App 后需要重新配置。
+- API Key 不写入 Git、不写入 README、不写入日志、不写入 Keychain、不写入 UserDefaults。
+- App 只把 API Key 作为 `Authorization: Bearer <key>` 发给固定余额接口，不会发给 GitHub、作者服务器或第三方统计服务。
+- 输入框支持直接粘贴 `sk-...`，也支持粘贴完整的 `Authorization: Bearer sk-...`，App 会自动整理成 Bearer 请求头。
 
 如果仍然担心，可以从 Git 克隆源码后自己检查 `MergeSASE/Sources/ProxyService.swift` 和 `MergeSASE/Sources/ContentView.swift`，再用 `bash build.sh` 在本机打包运行。
 

@@ -80,13 +80,10 @@ final class ProxyService {
     }
     var statusMessage: String = "就绪"
     var newDomain: String = ""
-    var developerBaseAddress: String = "" {
-        didSet { UserDefaults.standard.set(developerBaseAddress, forKey: developerBaseAddressKey) }
-    }
     var developerCredential: String = ""
     var developerBalanceStatus: DeveloperBalanceStatus = .unconfigured
     var developerBalanceSummary: String = "未配置"
-    var developerBalanceDetail: String = "配置开发者后台地址后即可授权登录"
+    var developerBalanceDetail: String = "配置 API Key 后即可读取开发者余额"
     var developerBalanceLastChecked: Date?
     var developerBalanceFields: [BalanceField] = []
     var developerBalanceDeltaText: String = ""
@@ -105,11 +102,11 @@ final class ProxyService {
         case .loading:
             return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "余额…"
         case .unauthorized:
-            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "请授权"
+            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "填 Key"
         case .error:
             return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? "余额失败"
         case .unconfigured:
-            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? (developerCredential.isEmpty ? "请授权" : "余额")
+            return developerBalanceAmount.map { formatMenuBarBalance($0) } ?? (developerCredential.isEmpty ? "填 Key" : "余额")
         }
     }
     var menuBarBalanceStatusText: String {
@@ -119,11 +116,11 @@ final class ProxyService {
         case .loading:
             return "正在刷新余额"
         case .unauthorized:
-            return "需要重新授权"
+            return "API Key 无效"
         case .error:
             return "刷新失败"
         case .unconfigured:
-            return developerCredential.isEmpty ? "未配置登录态" : "已保存登录态，等待刷新"
+            return developerCredential.isEmpty ? "未配置 API Key" : "已保存 API Key，等待刷新"
         }
     }
     var menuBarBalanceSystemImage: String {
@@ -141,19 +138,12 @@ final class ProxyService {
         }
     }
     var developerAddressDisplay: String {
-        developerBaseAddress.isEmpty ? "未配置" : developerBaseAddress
+        developerBalanceAPIURL.host ?? "未配置"
     }
-    var developerLoginURL: URL? {
-        developerEndpointURL(path: "/auth/login")
-    }
-    var developerCookieHost: String? {
-        developerBaseURL?.host
-    }
-
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-    private let developerBaseAddressKey = "developerBaseAddress"
     private let developerLastBalanceKey = "developerLastBalanceAmount"
     private let developerLastRequestCountKey = "developerLastRequestCount"
+    private let developerBalanceAPIURL = URL(string: "https://ai-platform-cicada-llm-api.limayao.com/api/usage/token/balance")!
     private var backupDir: String { "\(homeDir)/Library/Application Support/MergeSASE/Backup" }
     private var snapshotPath: String { "\(backupDir)/snapshot.json" }
     private let managedProxyKeys = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]
@@ -162,11 +152,7 @@ final class ProxyService {
     private var managedEnvKeys: [String] { managedProxyKeys + managedAllProxyKeys + managedNoProxyKeys }
     private let proxyRequiredHosts: [String] = []
     private var directCompanyHosts: [String] {
-        var hosts = ["developer.company.internal", "api.company.internal"]
-        if let host = developerCookieHost, !hosts.contains(host) {
-            hosts.append(host)
-        }
-        return hosts
+        ["developer.company.internal", "api.company.internal", "ai-platform-cicada-llm-api.limayao.com"]
     }
     private var startupNetworkCheckCompleted = false
     private var developerAutoRefreshTimer: Timer?
@@ -185,7 +171,6 @@ final class ProxyService {
         } else {
             self.companyDomains = saved
         }
-        self.developerBaseAddress = UserDefaults.standard.string(forKey: developerBaseAddressKey) ?? ""
         if UserDefaults.standard.object(forKey: "developerAutoRefreshDefaultedV2") == nil {
             self.developerAutoRefreshEnabled = true
             UserDefaults.standard.set(true, forKey: "developerAutoRefreshDefaultedV2")
@@ -537,7 +522,7 @@ final class ProxyService {
         if value.isEmpty {
             developerBalanceStatus = .unconfigured
             developerBalanceSummary = "未配置"
-            developerBalanceDetail = "授权后即可读取开发者余额"
+            developerBalanceDetail = "配置 API Key 后即可读取开发者余额"
             developerBalanceFields = []
             developerBalanceDeltaText = ""
             developerBalanceAmount = nil
@@ -545,29 +530,13 @@ final class ProxyService {
             UserDefaults.standard.removeObject(forKey: developerLastBalanceKey)
             UserDefaults.standard.removeObject(forKey: developerLastRequestCountKey)
             configureDeveloperAutoRefreshTimer()
-            log("开发者余额登录态已清除", .info)
+            log("开发者余额 API Key 已清除", .info)
         } else {
-            developerBalanceSummary = "已授权"
-            developerBalanceDetail = "登录态仅在本次运行内保存，点击刷新读取当前额度"
+            developerBalanceSummary = "已配置"
+            developerBalanceDetail = "API Key 仅在本次运行内保存，点击刷新读取当前额度"
             configureDeveloperAutoRefreshTimer()
-            log("开发者余额登录态已临时保存", .success)
+            log("开发者余额 API Key 已临时保存", .success)
         }
-    }
-
-    @discardableResult
-    func saveDeveloperBaseAddress(_ value: String) -> Bool {
-        guard let normalized = normalizedDeveloperBaseAddress(value) else {
-            developerBaseAddress = ""
-            developerBalanceStatus = .unconfigured
-            developerBalanceSummary = "填地址"
-            developerBalanceDetail = "请先输入开发者后台地址"
-            log("开发者后台地址未配置或无效", .warn)
-            return false
-        }
-        developerBaseAddress = normalized
-        developerBalanceDetail = developerCredential.isEmpty ? "已配置地址，下一步授权登录" : "本次运行已授权，点击刷新读取当前额度"
-        log("开发者后台地址已保存: \(normalized)", .success)
-        return true
     }
 
     func saveDeveloperCredential(_ value: String) {
@@ -596,34 +565,25 @@ final class ProxyService {
     }
 
     func refreshDeveloperBalance() async {
-        guard let developerBalanceURL = developerEndpointURL(path: "/api/user/developer-dashboard") else {
-            developerBalanceStatus = .unconfigured
-            developerBalanceSummary = "填地址"
-            developerBalanceDetail = "请先输入开发者后台地址"
-            developerBalanceDeltaText = ""
-            log("开发者余额未配置后台地址", .warn)
-            return
-        }
-
         let credential = developerCredential.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !credential.isEmpty else {
             developerBalanceStatus = .unconfigured
-            developerBalanceSummary = "请授权"
-            developerBalanceDetail = "授权后即可读取开发者余额"
+            developerBalanceSummary = "填 Key"
+            developerBalanceDetail = "配置 API Key 后即可读取开发者余额"
             developerBalanceDeltaText = ""
-            log("开发者余额未配置登录态", .warn)
+            log("开发者余额未配置 API Key", .warn)
             return
         }
 
         developerBalanceStatus = .loading
         developerBalanceSummary = "查询中…"
-        developerBalanceDetail = "正在读取 /api/user/developer-dashboard"
+        developerBalanceDetail = "正在读取 /api/usage/token/balance"
 
-        var request = URLRequest(url: developerBalanceURL)
+        var request = URLRequest(url: developerBalanceAPIURL)
         request.httpMethod = "GET"
         request.timeoutInterval = 12
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue(cookieHeader(from: credential), forHTTPHeaderField: "Cookie")
+        request.setValue("Bearer \(bearerToken(from: credential))", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("MergeSASE/1.0", forHTTPHeaderField: "User-Agent")
 
@@ -634,10 +594,10 @@ final class ProxyService {
 
             if statusCode == 401 || statusCode == 403 {
                 developerBalanceStatus = .unauthorized
-                developerBalanceSummary = "请授权"
-                developerBalanceDetail = "登录态无效或已过期，请重新授权"
+                developerBalanceSummary = "Key 无效"
+                developerBalanceDetail = "API Key 无效或已过期，请重新配置"
                 developerBalanceFields = []
-                log("开发者余额查询失败: 登录态无效或已过期", .warn)
+                log("开发者余额查询失败: API Key 无效或已过期", .warn)
                 return
             }
 
@@ -650,14 +610,7 @@ final class ProxyService {
                 return
             }
 
-            var parsed = parseBalanceResponse(data)
-            if let quotaBalance = await fetchDeveloperModelQuotaBalance(credential: credential) {
-                parsed.summary = quotaBalance.display
-                parsed.amount = quotaBalance.amount
-                parsed.fields = parsed.fields.map { field in
-                    field.key == "当前余额" ? BalanceField(key: field.key, value: quotaBalance.display) : field
-                }
-            }
+            let parsed = parseBalanceResponse(data)
             developerBalanceStatus = .ok
             developerBalanceSummary = parsed.summary
             developerBalanceDetail = parsed.detail
@@ -690,67 +643,17 @@ final class ProxyService {
         }
     }
 
-    private func cookieHeader(from value: String) -> String {
-        if value.contains("=") || value.contains(";") {
-            return value
+    private func bearerToken(from value: String) -> String {
+        var token = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.lowercased().hasPrefix("authorization:") {
+            token = String(token.dropFirst("authorization:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        return "session_id=\(value)"
-    }
-
-    private func fetchDeveloperModelQuotaBalance(credential: String) async -> (display: String, amount: Double)? {
-        guard let modelQuotaURL = developerEndpointURL(path: "/api/user/self/model_quota") else {
-            return nil
+        if token.lowercased().hasPrefix("bearer ") {
+            token = String(token.dropFirst("bearer ".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
-
-        var request = URLRequest(url: modelQuotaURL)
-        request.httpMethod = "GET"
-        request.timeoutInterval = 12
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue(cookieHeader(from: credential), forHTTPHeaderField: "Cookie")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("MergeSASE/1.0", forHTTPHeaderField: "User-Agent")
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard (200..<300).contains(statusCode) else { return nil }
-            return parseModelQuotaBalance(data)
-        } catch {
-            return nil
-        }
-    }
-
-    private var developerBaseURL: URL? {
-        guard let normalized = normalizedDeveloperBaseAddress(developerBaseAddress) else { return nil }
-        return URL(string: normalized)
-    }
-
-    private func developerEndpointURL(path: String) -> URL? {
-        guard let baseURL = developerBaseURL else { return nil }
-        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
-        components?.path = "/\(path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))"
-        return components?.url
-    }
-
-    private func normalizedDeveloperBaseAddress(_ value: String) -> String? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let withScheme = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
-        guard
-            var components = URLComponents(string: withScheme),
-            let host = components.host?.lowercased(),
-            !host.isEmpty,
-            host != "developer.company.internal",
-            host != "api.company.internal"
-        else {
-            return nil
-        }
-        components.scheme = components.scheme?.lowercased() ?? "https"
-        components.host = host
-        components.path = ""
-        components.query = nil
-        components.fragment = nil
-        return components.url?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return token.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func parseBalanceResponse(_ data: Data) -> (summary: String, detail: String, fields: [BalanceField], amount: Double?, requestCount: Double?) {
@@ -767,10 +670,11 @@ final class ProxyService {
             .filter { isBalanceLikeKey($0.key) }
             .sorted { balanceKeyPriority($0.key) < balanceKeyPriority($1.key) }
 
-        let fields = matches.prefix(6).map { BalanceField(key: $0.key, value: $0.value) }
+        let fields = matches.prefix(6).map { BalanceField(key: displayBalanceKey($0.key), value: displayBalanceValue($0.value)) }
         if let first = matches.first {
             let detail = fields.map { "\($0.key): \($0.value)" }.joined(separator: " · ")
-            return (first.value, detail, fields, currencyAmount(from: first.value), nil)
+            let amount = currencyAmount(from: first.value)
+            return (amount.map { formatCurrentBalance($0) } ?? first.value, detail, fields, amount, nil)
         }
 
         if let detail = flattened.first(where: { $0.key.lowercased().hasSuffix("detail") })?.value {
@@ -778,45 +682,6 @@ final class ProxyService {
         }
 
         return ("已返回", compactResponseText(data), [], nil, nil)
-    }
-
-    private func parseModelQuotaBalance(_ data: Data) -> (display: String, amount: Double)? {
-        guard
-            let object = try? JSONSerialization.jsonObject(with: data),
-            let root = object as? [String: Any]
-        else {
-            return nil
-        }
-
-        if
-            let overview = root["monthly_overview"] as? [String: Any],
-            let remainingQuota = numberValue(overview["display_remaining_quota"])
-        {
-            return (formatQuotaBalance(remainingQuota), remainingQuota / 500_000)
-        }
-
-        guard let groups = root["data"] as? [[String: Any]] else {
-            return nil
-        }
-        let monthlyGroups = groups.filter {
-            ($0["period"] as? String) == "monthly" && Int(numberValue($0["max_quota_type"]) ?? 0) == 0
-        }
-        guard !monthlyGroups.isEmpty else { return nil }
-
-        let starGroups = monthlyGroups.filter {
-            (($0["models"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines) == "*"
-        }
-        let source = starGroups.isEmpty ? monthlyGroups : starGroups
-        if source.contains(where: { (numberValue($0["max_quota"]) ?? 0) <= 0 }) {
-            return ("不限", 0)
-        }
-
-        let remainingQuota = source.reduce(0) { partial, group in
-            let maxQuota = max(0, numberValue(group["max_quota"]) ?? 0)
-            let usedQuota = max(0, numberValue(group["used_quota"]) ?? 0)
-            return partial + max(0, maxQuota - usedQuota)
-        }
-        return (formatQuotaBalance(remainingQuota), remainingQuota / 500_000)
     }
 
     private func parseDashboardStats(_ object: Any) -> (summary: String, detail: String, fields: [BalanceField], amount: Double?, requestCount: Double?)? {
@@ -898,12 +763,6 @@ final class ProxyService {
         "$\(String(format: "%.2f", value))"
     }
 
-    private func formatQuotaBalance(_ quota: Double) -> String {
-        let value = quota / 500_000
-        guard value.isFinite else { return "$0.00" }
-        return "$\(String(format: "%.2f", value))"
-    }
-
     private func formatMenuBarBalance(_ value: Double) -> String {
         formatCurrentBalance(value)
     }
@@ -939,6 +798,30 @@ final class ProxyService {
             return index
         }
         return 100
+    }
+
+    private func displayBalanceKey(_ key: String) -> String {
+        let last = key.components(separatedBy: ".").last ?? key
+        switch last.lowercased() {
+        case "balance", "current_balance", "available_balance", "remaining_balance":
+            return "当前余额"
+        case "used", "used_amount", "used_quota":
+            return "已使用"
+        case "total", "total_amount", "total_quota":
+            return "总额度"
+        default:
+            return last
+        }
+    }
+
+    private func displayBalanceValue(_ value: String) -> String {
+        if value.contains("$") || value == "不限" {
+            return value
+        }
+        if let amount = currencyAmount(from: value), value.trimmingCharacters(in: .whitespacesAndNewlines) == String(amount) {
+            return formatCurrentBalance(amount)
+        }
+        return value
     }
 
     private func flattenJSON(_ object: Any, prefix: String = "") -> [(key: String, value: String)] {
