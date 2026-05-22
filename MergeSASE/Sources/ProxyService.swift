@@ -177,7 +177,9 @@ final class ProxyService {
     }
     private var startupNetworkCheckCompleted = false
     private let developerBalanceAPIURL = URL(string: "https://ai-platform-cicada-llm-api.limayao.com/api/usage/token/balance")!
+    private let developerBalanceAutoRefreshInterval: UInt64 = 60_000_000_000
     private var developerBalanceRefreshTask: Task<Void, Never>?
+    private var developerBalanceAutoRefreshTask: Task<Void, Never>?
 
     init() {
         let savedProxyPreference = UserDefaults.standard.string(forKey: "externalProxyPreference") ?? ExternalProxyPreference.auto.rawValue
@@ -210,6 +212,89 @@ final class ProxyService {
                 browserSuggestion = nil
             }
         }
+    }
+
+    private func shellQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private func appleScriptStringLiteral(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\""
+    }
+
+    private func repairLaunchAgentWithAdministratorPrivileges(plistPath: String) async -> Bool {
+        let launchAgentsPath = "\(homeDir)/Library/LaunchAgents"
+        let currentUser = NSUserName()
+        let command = [
+            "mkdir -p \(shellQuoted(launchAgentsPath))",
+            "chflags nouchg \(shellQuoted(launchAgentsPath)) 2>/dev/null || true",
+            "chown \(shellQuoted(currentUser)):staff \(shellQuoted(launchAgentsPath))",
+            "chmod 755 \(shellQuoted(launchAgentsPath))",
+            "if [ -e \(shellQuoted(plistPath)) ]; then chflags nouchg \(shellQuoted(plistPath)) 2>/dev/null || true; chown \(shellQuoted(currentUser)):staff \(shellQuoted(plistPath)); chmod 644 \(shellQuoted(plistPath)); fi"
+        ].joined(separator: " && ")
+
+        log("LaunchAgents 权限需要管理员授权修复，请在系统弹窗中输入本机密码", .warn)
+        let script = "do shell script \(appleScriptStringLiteral(command)) with administrator privileges"
+        let result = await CommandRunner.run("/usr/bin/osascript", ["-e", script])
+        if result.succeeded {
+            log("LaunchAgents 权限已通过管理员授权修复", .success)
+            return true
+        }
+
+        let reason = result.stderr.isEmpty ? result.stdout : result.stderr
+        log("管理员授权修复 LaunchAgents 失败: \(reason.isEmpty ? "未返回详细原因" : reason)", .error)
+        return false
+    }
+
+    private func ensureLaunchAgentWritable(plistPath: String) async -> Bool {
+        let launchAgentsPath = "\(homeDir)/Library/LaunchAgents"
+        let fileManager = FileManager.default
+        do {
+            try fileManager.createDirectory(
+                atPath: launchAgentsPath,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o755]
+            )
+        } catch {
+            log("LaunchAgents 目录创建失败: \(error.localizedDescription)", .error)
+            return false
+        }
+
+        let currentUser = NSUserName()
+        _ = await CommandRunner.run("/usr/sbin/chown", [currentUser, launchAgentsPath])
+        _ = await CommandRunner.run("/bin/chmod", ["755", launchAgentsPath])
+
+        if fileManager.fileExists(atPath: plistPath) {
+            if fileManager.isWritableFile(atPath: plistPath) {
+                return true
+            }
+
+            _ = await CommandRunner.run("/usr/sbin/chown", [currentUser, plistPath])
+            _ = await CommandRunner.run("/bin/chmod", ["644", plistPath])
+            if fileManager.isWritableFile(atPath: plistPath) {
+                log("已修复旧 launchd 配置文件权限", .info)
+                return true
+            }
+
+            do {
+                try fileManager.removeItem(atPath: plistPath)
+                log("旧 launchd 配置不可写，已删除后重建", .warn)
+                return true
+            } catch {
+                log("旧 launchd 配置不可写且无法删除: \(error.localizedDescription)", .error)
+                return await repairLaunchAgentWithAdministratorPrivileges(plistPath: plistPath)
+            }
+        }
+
+        if fileManager.isWritableFile(atPath: launchAgentsPath) {
+            return true
+        }
+
+        if await repairLaunchAgentWithAdministratorPrivileges(plistPath: plistPath) {
+            return fileManager.isWritableFile(atPath: launchAgentsPath)
+        }
+
+        return false
     }
 
     private func managedPaths() -> (plist: String, guardScript: String, mergePaths: [String], chromePaths: [String]) {
@@ -256,6 +341,57 @@ final class ProxyService {
             .replacingOccurrences(of: "*.", with: "")
             .replacingOccurrences(of: "+.", with: "")
             .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+
+    private func isClashFakeIP(_ ip: String) -> Bool {
+        ip.hasPrefix("198.18.") || ip.hasPrefix("198.19.")
+    }
+
+    private func realIPv4(from output: String) -> String? {
+        output.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { ip in
+                let parts = ip.split(separator: ".")
+                return parts.count == 4
+                    && parts.allSatisfy { Int($0) != nil }
+                    && !isClashFakeIP(ip)
+            }
+    }
+
+    private func routeRange(for ip: String) -> String? {
+        let parts = ip.components(separatedBy: ".")
+        guard parts.count == 4, parts.allSatisfy({ Int($0) != nil }) else { return nil }
+        return "\(parts[0]).\(parts[1]).0.0/16"
+    }
+
+    private func systemNameservers() async -> [String] {
+        let result = await CommandRunner.runShell("scutil --dns 2>/dev/null | awk '/nameserver\\[[0-9]+\\]/{print $3}'")
+        var seen = Set<String>()
+        return result.stdout.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    private func resolveRealIPv4(_ host: String, nameservers: [String]? = nil) async -> String? {
+        let direct = await CommandRunner.runShell("dig +short \(host) 2>/dev/null")
+        if let ip = realIPv4(from: direct.stdout) {
+            return ip
+        }
+
+        let servers: [String]
+        if let nameservers {
+            servers = nameservers
+        } else {
+            servers = await systemNameservers()
+        }
+        for server in servers {
+            let result = await CommandRunner.runShell("dig @\(server) +short \(host) 2>/dev/null")
+            if let ip = realIPv4(from: result.stdout) {
+                return ip
+            }
+        }
+
+        return nil
     }
 
     private func host(_ host: String, isUnder domain: String) -> Bool {
@@ -558,9 +694,11 @@ final class ProxyService {
         guard let activeAPIKey else {
             developerBalanceStatus = .unconfigured
             developerBalanceSummary = "未配置"
+            syncDeveloperBalanceAutoRefreshLoop()
             return
         }
 
+        syncDeveloperBalanceAutoRefreshLoop()
         developerBalanceRefreshTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 800_000_000)
             guard !Task.isCancelled else { return }
@@ -568,20 +706,41 @@ final class ProxyService {
         }
     }
 
+    private func syncDeveloperBalanceAutoRefreshLoop() {
+        developerBalanceAutoRefreshTask?.cancel()
+        guard activeAPIKey != nil else {
+            developerBalanceAutoRefreshTask = nil
+            return
+        }
+
+        developerBalanceAutoRefreshTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: developerBalanceAutoRefreshInterval)
+                guard !Task.isCancelled, let currentAPIKey = activeAPIKey else { return }
+                await refreshDeveloperBalance(with: currentAPIKey)
+            }
+        }
+    }
+
     private func refreshDeveloperBalance(with apiKey: String) async {
-        developerBalanceStatus = .loading
-        developerBalanceSummary = "查询中…"
+        let requestToken = bearerToken(from: apiKey)
+        guard !requestToken.isEmpty else {
+            developerBalanceStatus = .unconfigured
+            developerBalanceSummary = "未配置"
+            return
+        }
 
         var request = URLRequest(url: developerBalanceAPIURL)
         request.httpMethod = "GET"
         request.timeoutInterval = 12
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue("Bearer \(bearerToken(from: apiKey))", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(requestToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("MergeSASE/1.0", forHTTPHeaderField: "User-Agent")
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
+            guard requestToken == bearerToken(from: activeAPIKey ?? "") else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard statusCode != 401 && statusCode != 403 else {
                 developerBalanceStatus = .unauthorized
@@ -824,18 +983,14 @@ final class ProxyService {
 
     private func writeMergeConfig(port: Int) async {
         // Resolve company domains to find internal IP ranges
-        var internalRanges = Set(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16", "198.18.0.0/16"])
+        var internalRanges = Set(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"])
+        let nameservers = await systemNameservers()
         for domain in companyDomains {
             for prefix in ["", "new-api", "api", "www", "portal", "vpn"] {
                 let host = prefix.isEmpty ? domain : "\(prefix).\(domain)"
-                let digRes = await CommandRunner.runShell("dig +short \(host) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
-                let ip = digRes.stdout.trimmingCharacters(in: .whitespaces)
-                if !ip.isEmpty {
-                    let parts = ip.components(separatedBy: ".")
-                    if parts.count == 4 {
-                        internalRanges.insert("\(parts[0]).\(parts[1]).0.0/16")
-                    }
-                    log("检测到公司内网 IP: \(host) → \(ip) → 排除路由 \(parts[0]).\(parts[1]).0.0/16", .info)
+                if let ip = await resolveRealIPv4(host, nameservers: nameservers), let range = routeRange(for: ip) {
+                    internalRanges.insert(range)
+                    log("检测到公司内网 IP: \(host) → \(ip) → 排除路由 \(range)", .info)
                     break
                 }
             }
@@ -952,7 +1107,6 @@ final class ProxyService {
             "- IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
             "- IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
             "- IP-CIDR,197.19.0.0/16,DIRECT,no-resolve",
-            "- IP-CIDR,198.18.0.0/16,DIRECT,no-resolve",
         ]
 
         for path in paths {
@@ -1111,17 +1265,13 @@ final class ProxyService {
         let guardDir = "\(homeDir)/.local/bin"
         let guardScript = "\(guardDir)/clash-proxy-guard.sh"
         try? FileManager.default.createDirectory(atPath: guardDir, withIntermediateDirectories: true, attributes: nil)
+        let startupNameservers = await systemNameservers()
         var guardBypassItems = ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
-                                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16", "198.18.0.0/16"]
+                                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"]
         for domain in companyDomains {
             guardBypassItems.append(contentsOf: broadBypassItems(for: domain))
-            let digRes = await CommandRunner.runShell("dig +short \(domain) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
-            let ip = digRes.stdout.trimmingCharacters(in: .whitespaces)
-            if !ip.isEmpty {
-                let parts = ip.components(separatedBy: ".")
-                if parts.count == 4 {
-                    guardBypassItems.append("\(parts[0]).\(parts[1]).0.0/16")
-                }
+            if let ip = await resolveRealIPv4(domain, nameservers: startupNameservers), let range = routeRange(for: ip) {
+                guardBypassItems.append(range)
             }
         }
         // Deduplicate
@@ -1162,7 +1312,6 @@ final class ProxyService {
 
         // Write launchd plist
         let plistPath = "\(homeDir)/Library/LaunchAgents/com.clash.proxyguard.plist"
-        try? FileManager.default.createDirectory(atPath: "\(homeDir)/Library/LaunchAgents", withIntermediateDirectories: true, attributes: nil)
         try? FileManager.default.createDirectory(atPath: "\(homeDir)/Library/Logs", withIntermediateDirectories: true, attributes: nil)
         let plistContent = """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -1179,26 +1328,29 @@ final class ProxyService {
         </dict>
         </plist>
         """
+        let canWriteLaunchAgent = await ensureLaunchAgentWritable(plistPath: plistPath)
         do {
-            try plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
+            guard canWriteLaunchAgent else {
+                throw CocoaError(.fileWriteNoPermission)
+            }
+            do {
+                try plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
+            } catch {
+                try plistContent.write(toFile: plistPath, atomically: false, encoding: .utf8)
+            }
             log("launchd 配置已写入", .success)
         } catch {
             log("launchd 配置写入失败: \(error.localizedDescription)", .error)
-            phase = .error; statusMessage = "launchd 配置写入失败"; return
+            log("已跳过自动守护；系统代理、Chrome、Clash 仍会继续配置。请检查 ~/Library/LaunchAgents 权限后重试。", .warn)
         }
 
         // Set system proxy — include resolved IP ranges in bypass
         var bypassList = ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
-                          "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16", "198.18.0.0/16"]
+                          "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"]
         for domain in companyDomains {
             bypassList.append(contentsOf: broadBypassItems(for: domain))
-            let digRes = await CommandRunner.runShell("dig +short \(domain) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
-            let ip = digRes.stdout.trimmingCharacters(in: .whitespaces)
-            if !ip.isEmpty {
-                let parts = ip.components(separatedBy: ".")
-                if parts.count == 4 {
-                    bypassList.append("\(parts[0]).\(parts[1]).0.0/16")
-                }
+            if let ip = await resolveRealIPv4(domain, nameservers: startupNameservers), let range = routeRange(for: ip) {
+                bypassList.append(range)
             }
         }
         // Deduplicate while preserving order
@@ -1261,21 +1413,24 @@ final class ProxyService {
         log("未自动重启 Chrome；如需让 Chrome 立即套用新策略，请手动重启 Chrome", .info)
 
         // Load launchd
-        _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
-        let loadRes = await CommandRunner.run("/bin/launchctl", ["load", plistPath])
-        if loadRes.succeeded {
-            log("守护已启动（事件驱动，公司 VPN 清代理时 2 秒内恢复）", .success)
-            guardLoaded = true
-        } else {
-            log("守护启动失败: \(loadRes.stderr)", .error)
-            phase = .error; statusMessage = "守护启动失败"; return
+        if FileManager.default.fileExists(atPath: plistPath) {
+            _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
+            let loadRes = await CommandRunner.run("/bin/launchctl", ["load", plistPath])
+            if loadRes.succeeded {
+                log("守护已启动（事件驱动，公司 VPN 清代理时 2 秒内恢复）", .success)
+                guardLoaded = true
+            } else {
+                log("守护启动失败: \(loadRes.stderr.isEmpty ? "launchctl 未返回详细原因" : loadRes.stderr)", .warn)
+                log("已继续完成其余配置；如公司 VPN 后续清掉系统代理，请修复 LaunchAgents 权限后重试。", .warn)
+                guardLoaded = false
+            }
         }
 
 
         await refreshStatus()
-        phase = guardLoaded && systemProxyEnabled ? .running : .error
-        statusMessage = phase == .running ? "运行中" : "部分异常"
-        log("========== 启动完成 ==========", phase == .running ? .success : .warn)
+        phase = systemProxyEnabled ? .running : .error
+        statusMessage = phase == .running ? (guardLoaded ? "运行中" : "已启动，守护未加载") : "部分异常"
+        log("========== 启动完成 ==========", phase == .running ? (guardLoaded ? .success : .warn) : .warn)
 
         if phase == .running {
             await checkInternalNetwork()
@@ -1621,12 +1776,24 @@ final class ProxyService {
             log("活跃虚拟网卡: \(utunIfs.joined(separator: ", "))", .info)
         }
 
-        // DNS resolve
+        let nameservers = await systemNameservers()
         let digRaw = await CommandRunner.runShell("dig +short \(domain) 2>/dev/null")
         let digClean = digRaw.stdout.components(separatedBy: "\n")
-            .filter { !$0.hasPrefix(";;") && !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-            .first ?? ""
-        internalResult.ip = digClean.trimmingCharacters(in: .whitespaces)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.hasPrefix(";;") && !$0.isEmpty } ?? ""
+        internalResult.ip = digClean
+
+        if isClashFakeIP(internalResult.ip) {
+            log("DNS 解析: \(domain) → \(internalResult.ip)", .info)
+            log("⚠️ 解析到 Clash fake-IP (\(internalResult.ip))，这不是公司内网真实 IP", .warn)
+            if let realIP = await resolveRealIPv4(domain, nameservers: nameservers) {
+                internalResult.ip = realIP
+                log("系统 DNS 解析: \(domain) → \(realIP)", .success)
+            } else {
+                internalResult.ip = ""
+                log("系统 DNS 暂未解析到 \(domain) 的真实内网 IP，尝试常见子域...", .warn)
+            }
+        }
 
         if !internalResult.ip.isEmpty {
             log("DNS 解析: \(domain) → \(internalResult.ip)", .info)
@@ -1637,10 +1804,6 @@ final class ProxyService {
                 log("路由信息: \(routeRes.stdout.replacingOccurrences(of: "\n", with: " | "))", .info)
             }
 
-            // Warn if IP looks like a Clash fake-IP
-            if internalResult.ip.hasPrefix("198.18.") {
-                log("⚠️ 解析到 Clash fake-IP (\(internalResult.ip))，fake-ip-filter 可能未生效", .warn)
-            }
         } else {
             log("根域 \(domain) 无 A 记录（常见于公司域名），尝试子域...", .info)
 
@@ -1659,9 +1822,7 @@ final class ProxyService {
             // Try common subdomains
             for sub in ["new-api", "www", "api", "portal", "vpn"] {
                 let subDomain = "\(sub).\(domain)"
-                let subDig = await CommandRunner.runShell("dig +short \(subDomain) 2>/dev/null | grep -v '^;;' | grep -E '^[0-9]' | head -1")
-                let subIP = subDig.stdout.trimmingCharacters(in: .whitespaces)
-                if !subIP.isEmpty {
+                if let subIP = await resolveRealIPv4(subDomain, nameservers: nameservers) {
                     log("发现子域解析: \(subDomain) → \(subIP)（根域 \(domain) 无 A 记录是正常的）", .info)
                     if internalResult.ip.isEmpty {
                         internalResult.ip = subIP
@@ -1702,7 +1863,10 @@ final class ProxyService {
             // DNS resolved — check route to verify internal path
             let routeRes = await CommandRunner.runShell("route -n get \(internalResult.ip) 2>/dev/null | grep 'interface:'")
             let routeIface = routeRes.stdout.replacingOccurrences(of: "interface:", with: "").trimmingCharacters(in: .whitespaces)
-            let isInternalRoute = routeIface.hasPrefix("utun") || routeIface.hasPrefix("en")
+            let isInternalRoute = routeIface.hasPrefix("utun")
+                || routeIface.hasPrefix("tun")
+                || routeIface.hasPrefix("tap")
+                || routeIface.hasPrefix("ppp")
 
             if isInternalRoute {
                 internalResult.accessible = true
