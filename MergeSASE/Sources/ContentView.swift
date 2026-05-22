@@ -328,7 +328,7 @@ struct ContentView: View {
                 )
                 SetupChecklistRow(
                     title: "API Key",
-                    detail: svc.hasConfiguredAPIKey ? "已配置 \(svc.configuredAPIKeyCount) 个 Key" : "还没有配置 API Key",
+                    detail: svc.hasConfiguredAPIKey ? "已配置" : "还没有配置 API Key",
                     done: svc.hasConfiguredAPIKey,
                     buttonTitle: svc.hasConfiguredAPIKey ? "修改 Key" : "配置 Key",
                     isPrimary: !svc.hasConfiguredAPIKey,
@@ -339,7 +339,7 @@ struct ContentView: View {
         .setupCard()
     }
 
-    // MARK: - Key Config Card
+    // MARK: - Balance Query Card
 
     private var keyConfigCard: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -348,9 +348,9 @@ struct ContentView: View {
             } label: {
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("配置 Key")
+                        Text("余额查询")
                             .font(.system(size: 17, weight: .semibold))
-                        Text("点击展开编辑 Key 列表")
+                        Text("点击展开编辑 API Key")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary.opacity(0.55))
                             .lineLimit(1)
@@ -388,36 +388,11 @@ struct ContentView: View {
 
             if showKeyConfig {
                 VStack(spacing: 8) {
-                    ForEach(Array(svc.displayedAPIKeys.enumerated()), id: \.offset) { index, key in
-                        APIKeyTextRow(
-                            index: index,
-                            value: key,
-                            onFocus: { focusedAPIKeyIndex = index },
-                            onChange: { svc.updateAPIKey(at: index, value: $0) },
-                            onDelete: {
-                                withAnimation {
-                                    svc.removeAPIKey(at: index)
-                                    focusedAPIKeyIndex = nil
-                                }
-                            }
-                        )
-                    }
-
-                    Button {
-                        svc.addAPIKey()
-                        focusedAPIKeyIndex = svc.displayedAPIKeys.count - 1
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "plus.circle.fill")
-                                .font(.system(size: 13, weight: .semibold))
-                            Text("新增 Key")
-                                .font(.system(size: 12, weight: .medium))
-                        }
-                        .foregroundColor(.blue)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.top, 2)
+                    APIKeyTextRow(
+                        value: svc.apiKey,
+                        onFocus: { focusedAPIKeyIndex = 0 },
+                        onChange: { svc.updateAPIKey($0) }
+                    )
                 }
                 .padding(.top, 1)
             }
@@ -433,20 +408,6 @@ struct ContentView: View {
                 Text("公司域名").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary.opacity(0.6))
                 Spacer()
                 HStack(spacing: 12) {
-                    if !shouldShowSetupChecklist {
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.15)) {
-                                setupChecklistHiddenForSession = false
-                                svc.showSetupChecklist()
-                            }
-                        } label: {
-                            Label("显示引导", systemImage: "slider.horizontal.3")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.blue)
-                        }
-                        .buttonStyle(.plain)
-                        .help("重新显示配置清单")
-                    }
                     Text(svc.companyDomains.isEmpty ? "未配置" : svc.companyDomains.joined(separator: ", "))
                         .font(.system(size: 11))
                         .foregroundColor(.secondary.opacity(0.5))
@@ -716,11 +677,9 @@ struct NetRow: View {
 }
 
 struct APIKeyTextRow: View {
-    let index: Int
     let value: String
     let onFocus: () -> Void
     let onChange: (String) -> Void
-    let onDelete: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
@@ -732,15 +691,6 @@ struct APIKeyTextRow: View {
             .font(.system(size: 13, weight: .medium))
             .foregroundColor(.primary.opacity(0.86))
             .onTapGesture(perform: onFocus)
-
-            Button(action: onDelete) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 13))
-                    .foregroundColor(.secondary.opacity(0.4))
-                    .frame(width: 26, height: 26)
-            }
-            .buttonStyle(.plain)
-            .help("删除这一行 Key")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 9)

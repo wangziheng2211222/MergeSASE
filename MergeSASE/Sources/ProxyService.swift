@@ -152,10 +152,7 @@ final class ProxyService {
         }
     }
     var hasConfiguredAPIKey: Bool {
-        apiKeys.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    }
-    var configuredAPIKeyCount: Int {
-        apiKeys.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+        apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
     var isSetupChecklistComplete: Bool {
         hasConfiguredCompanyDomain && hasConfiguredAPIKey
@@ -166,7 +163,7 @@ final class ProxyService {
     var canPermanentlyDismissSetupChecklist: Bool {
         isSetupChecklistComplete
     }
-    var displayedAPIKeys: [String] { apiKeys.isEmpty ? [""] : apiKeys }
+    var apiKey: String { apiKeys.first ?? "" }
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
     private var backupDir: String { "\(homeDir)/Library/Application Support/MergeSASE/Backup" }
     private var snapshotPath: String { "\(backupDir)/snapshot.json" }
@@ -547,28 +544,13 @@ final class ProxyService {
         setupChecklistDismissed = false
     }
 
-    func updateAPIKey(at index: Int, value: String) {
-        var keys = displayedAPIKeys
-        guard keys.indices.contains(index) else { return }
-        keys[index] = value
-        apiKeys = keys
-    }
-
-    func addAPIKey() {
-        apiKeys = displayedAPIKeys + [""]
-    }
-
-    func removeAPIKey(at index: Int) {
-        var keys = displayedAPIKeys
-        guard keys.indices.contains(index) else { return }
-        keys.remove(at: index)
-        apiKeys = keys.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    func updateAPIKey(_ value: String) {
+        apiKeys = [value]
     }
 
     private var activeAPIKey: String? {
-        apiKeys
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func scheduleDeveloperBalanceRefresh() {

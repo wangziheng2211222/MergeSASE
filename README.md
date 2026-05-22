@@ -1,6 +1,6 @@
 # MergeSASE&OpenVPN
 
-最新更新 v1.5：外网代理支持在自动 / Clash / Shadowrocket 之间选择；公司 VPN 适配支持 SASE 和 OpenVPN Connect。
+最新更新 v1.6：外网代理支持在自动 / Clash / Shadowrocket 之间选择；公司 VPN 适配支持 SASE 和 OpenVPN Connect。
 
 **遇到损坏无法打开，终端执行**
 xattr -cr（把app直接拖到终端里）
@@ -71,10 +71,10 @@ COPYFILE_DISABLE=1 ditto -c -k --norsrc --keepParent "MergeSASE&OpenVPN.app" "..
 
 这次调整开发者余额配置方式：
 
-- App 不再提供独立的「配置 Key」按钮，展开「配置 Key」区域后可以直接编辑 Key 列表。
+- App 不再提供独立的「配置 Key」按钮，展开「余额查询」区域后可以直接编辑一个 API Key。
 - App 不再显示刷新余额、删除 Key 等操作按钮。
 - 余额接口固定使用 `https://ai-platform-cicada-llm-api.limayao.com/api/usage/token/balance`，不暴露给用户配置。
-- 配置 Key 后，App 会自动读取并显示余额。
+- 填写 Key 后，App 会自动读取并显示余额。
 
 文档里的 `developer.company.internal` 和 `api.company.internal` 都是占位域名。实际使用时，请在本地应用里配置自己的公司域名，不要把真实域名、Cookie、session 值或 API Key 提交到 Git。
 
