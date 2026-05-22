@@ -6,53 +6,65 @@ struct ContentView: View {
     @State private var refreshTimer: Timer?
     @State private var showLog = false
     @State private var showDomainEditor = false
-    @State private var showDeveloperBalance = false
-    @State private var showDeveloperAdvanced = false
-    @State private var showDeveloperKeySetup = false
-    @State private var balanceDropPulse = false
-    @State private var lastAnimatedBalance: Double?
+    @State private var showKeyConfig = false
+    @State private var setupChecklistHiddenForSession = false
     @FocusState private var domainFieldFocused: Bool
+    @FocusState private var focusedAPIKeyIndex: Int?
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             VStack(spacing: 0) {
-                ScrollView {
-                    VStack(spacing: 10) {
-                        developerBalanceCard
-                        statusCard
-                        networkCard
-                        domainCard
-                        logCard
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        VStack(spacing: 10) {
+                            if shouldShowSetupChecklist {
+                                setupChecklistCard(scrollProxy: scrollProxy)
+                            }
+                            keyConfigCard
+                                .id("keyConfigCard")
+                            statusCard
+                            networkCard
+                            domainCard
+                                .id("companyDomainCard")
+                            logCard
+                        }
+                        .padding(14)
+                        .padding(.top, 6)
                     }
-                    .padding(14)
-                    .padding(.top, 6)
+                    .overlayScrollIndicators()
+                    .scrollContentBackground(.hidden)
+                    .background(bgGray)
                 }
-                .scrollContentBackground(.hidden)
-                .background(bgGray)
 
                 VStack(spacing: 0) {
                     Rectangle().fill(.primary.opacity(0.06)).frame(height: 1)
                     heroAction
                         .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
+                        .padding(.top, 12)
+                        .padding(.bottom, 7)
+                    footerContact
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 10)
                 }
                 .background(bgGray)
             }
 
+            if let suggestion = svc.browserSuggestion {
+                HStack {
+                    Spacer(minLength: 0)
+                    browserSuggestionBubble(suggestion)
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity)
+                    .padding(.top, 10)
+                    .padding(.horizontal, 10)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(2)
+            }
         }
         .frame(minWidth: 280, idealWidth: 300, minHeight: 380, idealHeight: 460)
         .background(bgGray)
-        .sheet(isPresented: $showDeveloperKeySetup) {
-            DeveloperKeySheet(
-                initialKey: svc.developerCredential
-            ) { key in
-                svc.saveDeveloperCredential(key)
-                showDeveloperKeySetup = false
-                Task { await svc.refreshDeveloperBalance() }
-            } onCancel: {
-                showDeveloperKeySetup = false
-            }
-        }
+        .animation(.spring(response: 0.22, dampingFraction: 0.86), value: svc.browserSuggestion)
         .onAppear {
             Task { await svc.checkNetworksOnLaunch() }
             refreshTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
@@ -62,49 +74,56 @@ struct ContentView: View {
         .onDisappear {
             refreshTimer?.invalidate(); refreshTimer = nil
         }
-        .onChange(of: svc.developerAutoRefreshEnabled) { _, enabled in
-            if enabled && !svc.developerCredential.isEmpty {
-                Task { await svc.refreshDeveloperBalance() }
+        .onChange(of: svc.externalProxyPreference) { _, _ in
+            Task { await svc.refreshStatus() }
+        }
+        .onChange(of: svc.hasConfiguredCompanyDomain) { _, configured in
+            if configured {
+                setupChecklistHiddenForSession = false
             }
         }
-        .onChange(of: svc.developerBalanceAmount) { oldValue, newValue in
-            if let old = oldValue ?? lastAnimatedBalance, let new = newValue, new < old {
-                withAnimation(.spring(response: 0.25, dampingFraction: 0.55)) {
-                    balanceDropPulse = true
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        balanceDropPulse = false
-                    }
-                }
-            }
-            if let newValue {
-                lastAnimatedBalance = newValue
+        .onChange(of: svc.hasConfiguredAPIKey) { _, configured in
+            if configured {
+                setupChecklistHiddenForSession = false
             }
         }
     }
 
-    private func toggleDeveloperBalanceCard() {
+    private var shouldShowSetupChecklist: Bool {
+        svc.shouldShowSetupChecklist && !setupChecklistHiddenForSession
+    }
+
+    private func toggleKeyConfigCard() {
         withAnimation(.easeInOut(duration: 0.15)) {
-            if showDeveloperBalance {
-                showDeveloperBalance = false
-                showDeveloperAdvanced = false
-            } else {
-                showDeveloperBalance = true
-                showDeveloperAdvanced = false
-            }
+            showKeyConfig.toggle()
         }
     }
 
-    private func beginDeveloperAuthorization() {
-        showDeveloperKeySetup = true
+    private func beginCompanyDomainSetup(scrollProxy: ScrollViewProxy) {
+        withAnimation(.easeInOut(duration: 0.15)) {
+            showDomainEditor = true
+            scrollProxy.scrollTo("companyDomainCard", anchor: .top)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            domainFieldFocused = true
+        }
+    }
+
+    private func beginAPIKeySetup(scrollProxy: ScrollViewProxy) {
+        withAnimation(.easeInOut(duration: 0.15)) {
+            showKeyConfig = true
+            scrollProxy.scrollTo("keyConfigCard", anchor: .top)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            focusedAPIKeyIndex = 0
+        }
     }
 
     // MARK: - Header
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text("MergeSASE")
+            Text("MergeSASE&OpenVPN")
                 .font(.system(size: 13, weight: .semibold))
             Spacer()
             HStack(spacing: 3) {
@@ -131,16 +150,21 @@ struct ContentView: View {
                     secondaryBtn("强制停止", icon: "stop.fill") { Task { await svc.stop() } }
                 }
             case .idle, .running:
-                if guardEffectivelyRunning {
+                if svc.guardEffectivelyRunning {
                     actionBtn("停止守护", icon: "stop.fill", tint: Color(.systemGray)) { Task { await svc.stop() } }
                 } else {
-                    actionBtn("一键启动", icon: "play.fill", tint: .blue) { Task { await svc.start() } }
+                    actionBtn(
+                        svc.hasConfiguredCompanyDomain ? "一键启动" : "先配置公司域名",
+                        icon: svc.hasConfiguredCompanyDomain ? "play.fill" : "exclamationmark.circle.fill",
+                        tint: .blue,
+                        disabled: !svc.hasConfiguredCompanyDomain
+                    ) { Task { await svc.start() } }
                 }
             }
         }
     }
 
-    private func actionBtn(_ label: String, icon: String?, tint: Color, loading: Bool = false, action: @escaping () -> Void) -> some View {
+    private func actionBtn(_ label: String, icon: String?, tint: Color, loading: Bool = false, disabled: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 6) {
                 if loading {
@@ -153,7 +177,8 @@ struct ContentView: View {
             .frame(maxWidth: .infinity).padding(.vertical, 2)
         }
         .buttonStyle(.borderedProminent).controlSize(.extraLarge).tint(tint)
-        .disabled(loading)
+        .disabled(loading || disabled)
+        .help(disabled ? "请先在新手引导里添加公司域名" : "")
     }
 
     private func secondaryBtn(_ label: String, icon: String, action: @escaping () -> Void) -> some View {
@@ -162,11 +187,49 @@ struct ContentView: View {
         }.buttonStyle(.borderless)
     }
 
+    private var footerContact: some View {
+        Text("有问题联系 钉钉 @子恒 微信：steve_sunrui")
+            .font(.system(size: 10))
+            .foregroundColor(.secondary.opacity(0.45))
+            .textSelection(.enabled)
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .frame(maxWidth: .infinity)
+    }
+
+    private func browserSuggestionBubble(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "bubble.left.and.exclamationmark.bubble.right.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.blue)
+                .frame(width: 16)
+            Text(text)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.primary.opacity(0.86))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 9)
+        .padding(.horizontal, 10)
+        .frame(maxWidth: 236, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(.primary.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .primary.opacity(0.12), radius: 10, y: 4)
+    }
+
     // MARK: - Status Card
 
     private var statusCard: some View {
         VStack(spacing: 0) {
-            StatRow(icon: "network", label: "Clash 进程", detail: svc.clashRunning ? "运行中" : "未运行", active: svc.clashRunning)
+            StatRow(icon: "lock.shield", label: "公司 VPN", detail: svc.vpnClientRunning ? "\(svc.vpnClientName) · \(svc.vpnClientDetail)" : svc.vpnClientDetail, active: svc.vpnClientRunning)
+            sep
+            ExternalProxyRow(
+                detail: svc.externalProxyRunning ? "\(svc.externalProxyName) · \(svc.externalProxyDetail)" : "\(svc.externalProxyPreference.label) · 未运行",
+                active: svc.externalProxyRunning,
+                selection: $svc.externalProxyPreference
+            )
             sep
             StatRow(icon: "arrow.left.arrow.right", label: "系统代理", detail: svc.systemProxyEnabled ? "\(svc.proxyHost):\(svc.clashPort)" : "未启用", active: svc.systemProxyEnabled)
             sep
@@ -198,7 +261,7 @@ struct ContentView: View {
 
             NetRow(
                 label: "公司内网",
-                detail: svc.companyDomains.first ?? "company.internal",
+                detail: svc.companyDomains.first ?? "未配置",
                 ip: svc.internalResult.ip,
                 latency: svc.internalResult.latencyMs,
                 accessible: svc.internalResult.ip.isEmpty && svc.internalResult.statusCode.isEmpty ? nil : svc.internalResult.accessible
@@ -215,18 +278,79 @@ struct ContentView: View {
         .card()
     }
 
-    // MARK: - Developer Balance Card
+    // MARK: - Setup Checklist
 
-    private var developerBalanceCard: some View {
+    private func setupChecklistCard(scrollProxy: ScrollViewProxy) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(width: 36, height: 36)
+                    .background(Color.blue, in: RoundedRectangle(cornerRadius: 8))
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("先配置你的公司网络")
+                        .font(.system(size: 18, weight: .semibold))
+                    Text("添加公司域名后，内网请求才会绕过外网代理直连公司 VPN。")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary.opacity(0.78))
+                        .lineSpacing(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 4)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        if svc.canPermanentlyDismissSetupChecklist {
+                            svc.dismissSetupChecklist()
+                        } else {
+                            setupChecklistHiddenForSession = true
+                        }
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary.opacity(0.45))
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(.plain)
+                .help(svc.canPermanentlyDismissSetupChecklist ? "收起配置清单" : "本次先收起")
+            }
+
+            VStack(spacing: 6) {
+                SetupChecklistRow(
+                    title: "公司域名",
+                    detail: svc.hasConfiguredCompanyDomain ? svc.companyDomains.joined(separator: ", ") : "还没有配置公司域名",
+                    done: svc.hasConfiguredCompanyDomain,
+                    buttonTitle: svc.hasConfiguredCompanyDomain ? "修改配置" : "添加域名",
+                    isPrimary: true,
+                    action: { beginCompanyDomainSetup(scrollProxy: scrollProxy) }
+                )
+                SetupChecklistRow(
+                    title: "API Key",
+                    detail: svc.hasConfiguredAPIKey ? "已配置 \(svc.configuredAPIKeyCount) 个 Key" : "还没有配置 API Key",
+                    done: svc.hasConfiguredAPIKey,
+                    buttonTitle: svc.hasConfiguredAPIKey ? "修改 Key" : "配置 Key",
+                    isPrimary: !svc.hasConfiguredAPIKey,
+                    action: { beginAPIKeySetup(scrollProxy: scrollProxy) }
+                )
+            }
+        }
+        .setupCard()
+    }
+
+    // MARK: - Key Config Card
+
+    private var keyConfigCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             Button {
-                toggleDeveloperBalanceCard()
+                toggleKeyConfigCard()
             } label: {
                 HStack(alignment: .center, spacing: 12) {
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("开发者余额")
+                        Text("配置 Key")
                             .font(.system(size: 17, weight: .semibold))
-                        Text(developerBalanceStatusLine)
+                        Text("点击展开编辑 Key 列表")
                             .font(.system(size: 12))
                             .foregroundColor(.secondary.opacity(0.55))
                             .lineLimit(1)
@@ -234,39 +358,11 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                     HStack(alignment: .center, spacing: 12) {
-                        VStack(alignment: .trailing, spacing: 5) {
-                            if svc.developerBalanceStatus == .loading {
-                                ProgressView()
-                                    .controlSize(.regular)
-                                    .tint(developerBalanceColor)
-                                    .frame(width: 44, height: 36, alignment: .trailing)
-                            } else {
-                                Text(svc.developerBalanceSummary)
-                                    .font(.system(size: 30, weight: .bold))
-                                    .foregroundColor(developerBalanceColor)
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.75)
-                                    .monospacedDigit()
-                                    .fixedSize(horizontal: true, vertical: false)
-                                    .scaleEffect(balanceDropPulse ? 1.07 : 1.0)
-                                    .shadow(color: balanceDropPulse ? developerBalanceColor.opacity(0.35) : .clear, radius: balanceDropPulse ? 8 : 0)
-                            }
-
-                            if svc.developerBalanceStatus != .loading, !svc.developerBalanceDeltaText.isEmpty {
-                                Text(svc.developerBalanceDeltaText)
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundColor(developerBalanceDeltaColor)
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 3)
-                                    .background(developerBalanceDeltaColor.opacity(0.1), in: Capsule())
-                                    .fixedSize(horizontal: true, vertical: false)
-                            }
-                        }
-
-                        Image(systemName: "chevron.\(showDeveloperBalance ? "down" : "right")")
-                            .font(.system(size: 9, weight: .semibold))
+                        Image(systemName: "chevron.\(showKeyConfig ? "down" : "right")")
+                            .font(.system(size: 11, weight: .semibold))
                             .foregroundColor(.secondary.opacity(0.35))
-                            .frame(width: 12, height: 52, alignment: .trailing)
+                            .frame(width: 32, height: 56, alignment: .center)
+                            .contentShape(Rectangle())
                     }
                 }
                 .contentShape(Rectangle())
@@ -274,118 +370,40 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
 
-            if showDeveloperBalance, !developerMetricFields.isEmpty {
-                VStack(spacing: 4) {
-                    ForEach(developerMetricFields, id: \.key) { field in
-                        DeveloperMetricTile(field: field)
+            if showKeyConfig {
+                VStack(spacing: 8) {
+                    ForEach(Array(svc.displayedAPIKeys.enumerated()), id: \.offset) { index, key in
+                        APIKeyTextRow(
+                            index: index,
+                            value: key,
+                            onFocus: { focusedAPIKeyIndex = index },
+                            onChange: { svc.updateAPIKey(at: index, value: $0) },
+                            onDelete: {
+                                withAnimation {
+                                    svc.removeAPIKey(at: index)
+                                    focusedAPIKeyIndex = nil
+                                }
+                            }
+                        )
                     }
+
+                    Button {
+                        svc.addAPIKey()
+                        focusedAPIKeyIndex = svc.displayedAPIKeys.count - 1
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text("新增 Key")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundColor(.blue)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 2)
                 }
                 .padding(.top, 1)
-            }
-
-            if shouldShowDeveloperAuthorizationPrompt {
-                HStack {
-                    Spacer()
-                    Button {
-                        beginDeveloperAuthorization()
-                    } label: {
-                        Label(developerAuthorizationTitle, systemImage: "key.fill")
-                            .font(.system(size: 12, weight: .semibold))
-                            .padding(.horizontal, 8)
-                            .frame(minHeight: 26)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .help(developerAuthorizationHelp)
-                }
-            }
-
-            if showDeveloperBalance {
-                Divider().opacity(0.35)
-
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { showDeveloperAdvanced.toggle() }
-                } label: {
-                    HStack {
-                        Text("高级设置")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(.secondary.opacity(0.65))
-                        Spacer()
-                        HStack(spacing: 12) {
-                            if let checkedAt = svc.developerBalanceLastChecked {
-                                Text("更新 \(timeF.string(from: checkedAt))")
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(.secondary.opacity(0.4))
-                            }
-                            Image(systemName: "chevron.\(showDeveloperAdvanced ? "down" : "right")")
-                                .font(.system(size: 8, weight: .medium))
-                                .foregroundColor(.secondary.opacity(0.3))
-                                .frame(width: 12, height: 40, alignment: .trailing)
-                        }
-                    }
-                }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle())
-                .frame(minHeight: 28)
-
-                if showDeveloperAdvanced {
-                    VStack(spacing: 8) {
-                        HStack(spacing: 8) {
-                            Text("余额接口")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundColor(.secondary.opacity(0.65))
-                            Text(svc.developerAddressDisplay)
-                                .font(.system(size: 10))
-                                .foregroundColor(.secondary.opacity(0.55))
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer()
-                        }
-
-                        HStack(spacing: 6) {
-                            Spacer()
-
-                            Button {
-                                beginDeveloperAuthorization()
-                            } label: {
-                                Text(developerAuthorizationTitle)
-                                    .font(.system(size: 9, weight: .medium))
-                                    .frame(minHeight: 24)
-                            }
-                            .help(developerAuthorizationHelp)
-                            .controlSize(.regular)
-
-                            Button {
-                                Task { await svc.refreshDeveloperBalance() }
-                            } label: {
-                                Label("刷新", systemImage: "arrow.clockwise")
-                                    .font(.system(size: 9, weight: .medium))
-                            }
-                            .buttonStyle(.borderless)
-                            .controlSize(.small)
-                            .help("刷新余额")
-                            .disabled(svc.developerBalanceStatus == .loading || svc.developerCredential.isEmpty)
-
-                            Button {
-                                svc.clearDeveloperCredential()
-                            } label: {
-                                Label("删除", systemImage: "trash")
-                                    .font(.system(size: 9, weight: .medium))
-                            }
-                            .buttonStyle(.borderless)
-                            .controlSize(.small)
-                            .help("清除 API Key")
-                            .disabled(svc.developerCredential.isEmpty)
-
-                            Toggle("自动刷新", isOn: $svc.developerAutoRefreshEnabled)
-                                .toggleStyle(.switch)
-                                .controlSize(.small)
-                                .font(.system(size: 9, weight: .medium))
-                                .foregroundColor(.secondary)
-                                .disabled(svc.developerCredential.isEmpty)
-                        }
-                    }
-                }
             }
         }
         .prominentCard()
@@ -395,39 +413,63 @@ struct ContentView: View {
 
     private var domainCard: some View {
         VStack(spacing: 0) {
-            Button {
+            HStack(spacing: 4) {
+                Text("公司域名").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary.opacity(0.6))
+                Spacer()
+                HStack(spacing: 12) {
+                    if !shouldShowSetupChecklist {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                setupChecklistHiddenForSession = false
+                                svc.showSetupChecklist()
+                            }
+                        } label: {
+                            Label("显示引导", systemImage: "slider.horizontal.3")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(.blue)
+                        }
+                        .buttonStyle(.plain)
+                        .help("重新显示配置清单")
+                    }
+                    Text(svc.companyDomains.isEmpty ? "未配置" : svc.companyDomains.joined(separator: ", "))
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary.opacity(0.5))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Image(systemName: "chevron.\(showDomainEditor ? "down" : "right")")
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundColor(.secondary.opacity(0.3))
+                        .frame(width: 12, alignment: .trailing)
+                }
+            }
+            .contentShape(Rectangle())
+            .padding(.vertical, 8)
+            .onTapGesture {
+                let opening = !showDomainEditor
                 withAnimation(.easeInOut(duration: 0.15)) { showDomainEditor.toggle() }
-            } label: {
-                HStack(spacing: 4) {
-                    Text("公司域名").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary.opacity(0.6))
-                    Spacer()
-                    HStack(spacing: 12) {
-                        Text(svc.companyDomains.joined(separator: ", ")).font(.system(size: 11)).foregroundColor(.secondary.opacity(0.5)).lineLimit(1)
-                        Image(systemName: "chevron.\(showDomainEditor ? "down" : "right")")
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundColor(.secondary.opacity(0.3))
-                            .frame(width: 12, height: 40, alignment: .trailing)
+                if opening {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        domainFieldFocused = true
                     }
                 }
-                .contentShape(Rectangle())
-                .frame(minHeight: 36)
             }
-            .buttonStyle(.plain)
 
             if showDomainEditor {
-                VStack(spacing: 6) {
+                VStack(spacing: 8) {
                     ForEach(svc.companyDomains, id: \.self) { domain in
                         HStack {
                             Text(domain).font(.system(size: 13))
                             Spacer()
-                            if svc.companyDomains.count > 1 {
-                                Button { withAnimation { svc.removeDomain(domain) } } label: {
-                                    Image(systemName: "xmark.circle.fill").font(.system(size: 12)).foregroundColor(.secondary.opacity(0.4))
-                                }.buttonStyle(.plain)
-                            }
+                            Button { withAnimation { svc.removeDomain(domain) } } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.secondary.opacity(0.4))
+                                    .frame(width: 28, height: 28)
+                            }.buttonStyle(.plain)
                         }
+                        .frame(minHeight: 30)
                     }
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         TextField("新增域名", text: $svc.newDomain)
                             .textFieldStyle(.plain).font(.system(size: 13))
                             .focused($domainFieldFocused)
@@ -440,39 +482,53 @@ struct ContentView: View {
                         .buttonStyle(.plain)
                         .disabled(svc.newDomain.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
+                    .padding(.vertical, 7)
+                    .padding(.horizontal, 10)
+                    .frame(minHeight: 42)
+                    .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+                    .contentShape(RoundedRectangle(cornerRadius: 7))
+                    .onTapGesture {
+                        domainFieldFocused = true
+                    }
                 }
-                .padding(.top, 6)
+                .padding(.top, 4)
             }
         }
         .card()
+        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .onTapGesture {
+            guard !showDomainEditor else { return }
+            withAnimation(.easeInOut(duration: 0.15)) { showDomainEditor = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                domainFieldFocused = true
+            }
+        }
     }
 
     // MARK: - Log Card
 
     private var logCard: some View {
         VStack(spacing: 0) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) { showLog.toggle() }
-            } label: {
-                HStack(spacing: 4) {
-                    Text("日志").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary.opacity(0.6))
-                    if !showLog, let last = svc.logs.last {
-                        Circle().fill(.secondary.opacity(0.2)).frame(width: 2, height: 2)
-                        Text(last.text).font(.system(size: 11)).foregroundColor(.secondary.opacity(0.45)).lineLimit(1)
-                    }
-                    Spacer()
-                    HStack(spacing: 12) {
-                        Text("\(svc.logs.count)").font(.system(size: 10)).foregroundColor(.secondary.opacity(0.25))
-                        Image(systemName: "chevron.\(showLog ? "down" : "right")")
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundColor(.secondary.opacity(0.3))
-                            .frame(width: 12, height: 40, alignment: .trailing)
-                    }
+            HStack(spacing: 4) {
+                Text("日志").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary.opacity(0.6))
+                if !showLog, let last = svc.logs.last {
+                    Circle().fill(.secondary.opacity(0.2)).frame(width: 2, height: 2)
+                    Text(last.text).font(.system(size: 11)).foregroundColor(.secondary.opacity(0.45)).lineLimit(1)
                 }
-                .contentShape(Rectangle())
-                .frame(minHeight: 36)
+                Spacer()
+                HStack(spacing: 12) {
+                    Text("\(svc.logs.count)").font(.system(size: 10)).foregroundColor(.secondary.opacity(0.25))
+                    Image(systemName: "chevron.\(showLog ? "down" : "right")")
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundColor(.secondary.opacity(0.3))
+                        .frame(width: 12, alignment: .trailing)
+                }
             }
-            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .padding(.vertical, 8)
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.15)) { showLog.toggle() }
+            }
 
             if showLog {
                 ScrollViewReader { proxy in
@@ -488,6 +544,7 @@ struct ContentView: View {
                             }
                         }
                     }
+                    .overlayScrollIndicators()
                     .frame(maxHeight: 130)
                     .onChange(of: svc.logs.count) { _, _ in
                         if let last = svc.logs.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
@@ -512,6 +569,11 @@ struct ContentView: View {
             }
         }
         .card()
+        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .onTapGesture {
+            guard !showLog else { return }
+            withAnimation(.easeInOut(duration: 0.15)) { showLog = true }
+        }
     }
 
     // MARK: - Footer
@@ -520,74 +582,6 @@ struct ContentView: View {
 
     private var phaseColor: Color {
         switch svc.phase { case .idle: .secondary; case .starting, .stopping: .orange; case .running: .green; case .error: .red }
-    }
-    private var guardEffectivelyRunning: Bool {
-        svc.clashRunning
-            && svc.systemProxyEnabled
-            && svc.guardLoaded
-            && svc.appEnvFixed
-            && svc.chromePolicyInstalled
-    }
-    private var developerBalanceColor: Color {
-        switch svc.developerBalanceStatus {
-        case .ok: Color(red: 0.92, green: 0.64, blue: 0.08)
-        case .loading: .blue
-        case .unauthorized, .error: .red
-        case .unconfigured: .secondary
-        }
-    }
-    private var developerBalanceStatusLine: String {
-        switch svc.developerBalanceStatus {
-        case .ok:
-            return "账户额度实时概览"
-        case .loading:
-            return "正在刷新余额数据"
-        case .unauthorized:
-            return "API Key 无效，需要重新配置"
-        case .error:
-            return "刷新失败，请稍后重试"
-        case .unconfigured:
-            return "配置 API Key 后自动读取余额"
-        }
-    }
-    private var developerBalanceDeltaColor: Color {
-        .secondary
-    }
-    private var developerBalanceDeltaDisplay: String {
-        svc.developerBalanceDeltaText.isEmpty ? "相比上次 $0.00" : svc.developerBalanceDeltaText
-    }
-    private var developerMetricFields: [BalanceField] {
-        svc.developerBalanceFields.filter { $0.key != "当前余额" }
-    }
-    private var developerMetricColumns: [GridItem] {
-        [GridItem(.flexible(), spacing: 9), GridItem(.flexible(), spacing: 9)]
-    }
-    private var developerAuthorizationTitle: String {
-        if svc.developerCredential.isEmpty { return "配置 Key" }
-        switch svc.developerBalanceStatus {
-        case .unauthorized:
-            return "更换 Key"
-        case .error:
-            return "更换 Key"
-        default:
-            return "已配置"
-        }
-    }
-    private var shouldShowDeveloperAuthorizationPrompt: Bool {
-        svc.developerCredential.isEmpty || svc.developerBalanceStatus == .unauthorized
-    }
-    private var developerAuthorizationIcon: String? {
-        developerAuthorizationTitle == "已配置" ? nil : "key.fill"
-    }
-    private var developerAuthorizationHelp: String {
-        switch developerAuthorizationTitle {
-        case "已配置":
-            return "API Key 已配置，点击可更换"
-        case "更换 Key":
-            return "刷新失败或 API Key 无效，请重新配置"
-        default:
-            return "输入 sk- 开头的 API Key"
-        }
     }
     private func logColor(_ level: LogLevel) -> Color {
         switch level { case .success: .green; case .warn: .orange; case .error: .red; case .info: .primary }
@@ -608,10 +602,58 @@ struct StatRow: View {
             Spacer()
             HStack(spacing: 3) {
                 Circle().fill(active ? .green : .secondary.opacity(0.15)).frame(width: 4, height: 4)
-                Text(detail).font(.system(size: 12)).foregroundColor(active ? .secondary : .secondary.opacity(0.35))
+                Text(detail)
+                    .font(.system(size: 12))
+                    .foregroundColor(active ? .secondary : .secondary.opacity(0.35))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
         }
         .padding(.vertical, 9)
+    }
+}
+
+struct ExternalProxyRow: View {
+    let detail: String
+    let active: Bool
+    @Binding var selection: ExternalProxyPreference
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "network")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(active ? .accentColor : .secondary.opacity(0.3))
+                .frame(width: 14)
+                .padding(.top, 6)
+
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Text("外网代理").font(.system(size: 13))
+                    Spacer(minLength: 8)
+
+                    Picker("代理选择", selection: $selection) {
+                        ForEach(ExternalProxyPreference.allCases) { preference in
+                            Text(preference.label).tag(preference)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .controlSize(.small)
+                    .labelsHidden()
+                    .frame(width: 168)
+                }
+
+                HStack(spacing: 3) {
+                    Circle().fill(active ? .green : .secondary.opacity(0.15)).frame(width: 4, height: 4)
+                    Text(detail)
+                        .font(.system(size: 11))
+                        .foregroundColor(active ? .secondary : .secondary.opacity(0.35))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 8)
     }
 }
 
@@ -645,25 +687,80 @@ struct NetRow: View {
     }
 }
 
-struct DeveloperMetricTile: View {
-    let field: BalanceField
+struct APIKeyTextRow: View {
+    let index: Int
+    let value: String
+    let onFocus: () -> Void
+    let onChange: (String) -> Void
+    let onDelete: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(field.key)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(.secondary.opacity(0.65))
-                .lineLimit(1)
-            Spacer(minLength: 8)
-            Text(field.value)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.primary.opacity(0.86))
-                .lineLimit(1)
-                .minimumScaleFactor(0.82)
+            TextField("API Key", text: Binding(
+                get: { value },
+                set: { onChange($0) }
+            ))
+            .textFieldStyle(.plain)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(.primary.opacity(0.86))
+            .onTapGesture(perform: onFocus)
+
+            Button(action: onDelete) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary.opacity(0.4))
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+            .help("删除这一行 Key")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 5)
-        .padding(.horizontal, 8)
+        .padding(.vertical, 9)
+        .padding(.horizontal, 10)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+struct SetupChecklistRow: View {
+    let title: String
+    let detail: String
+    let done: Bool
+    let buttonTitle: String
+    let isPrimary: Bool
+    let action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: done ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(done ? .green : .secondary.opacity(0.32))
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary.opacity(0.6))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                action()
+            } label: {
+                Text(buttonTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(isPrimary ? .white : .blue)
+                    .frame(minWidth: isPrimary ? 76 : 62, minHeight: 28)
+                    .padding(.horizontal, 3)
+                    .background(isPrimary ? Color.blue : Color.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 10)
         .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
     }
 }
@@ -671,6 +768,12 @@ struct DeveloperMetricTile: View {
 // MARK: - Card modifier
 
 extension View {
+    func overlayScrollIndicators() -> some View {
+        self
+            .scrollIndicators(.hidden)
+            .background(OverlayScrollIndicatorConfigurator())
+    }
+
     func card() -> some View {
         self
             .padding(12)
@@ -684,63 +787,42 @@ extension View {
             .background(cardBg, in: RoundedRectangle(cornerRadius: 10))
             .shadow(color: .primary.opacity(0.05), radius: 4, y: 2)
     }
+
+    func setupCard() -> some View {
+        self
+            .padding(16)
+            .background(cardBg, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.blue.opacity(0.2), lineWidth: 1)
+            )
+            .shadow(color: .primary.opacity(0.05), radius: 4, y: 2)
+    }
+}
+
+private struct OverlayScrollIndicatorConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            configureScrollView(above: view)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            configureScrollView(above: nsView)
+        }
+    }
+
+    private func configureScrollView(above view: NSView) {
+        guard let scrollView = view.enclosingScrollView else { return }
+        scrollView.scrollerStyle = .overlay
+        scrollView.autohidesScrollers = true
+        scrollView.hasHorizontalScroller = false
+    }
 }
 
 private let timeF: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
 private let bgGray = Color(red: 0.95, green: 0.95, blue: 0.94)
 private let cardBg = Color(nsColor: .windowBackgroundColor)
-
-// MARK: - Developer Key
-
-struct DeveloperKeySheet: View {
-    @State private var draftKey: String
-    @State private var showInvalidMessage = false
-    let onSave: (String) -> Void
-    let onCancel: () -> Void
-
-    init(initialKey: String, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
-        self._draftKey = State(initialValue: initialKey)
-        self.onSave = onSave
-        self.onCancel = onCancel
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("配置 API Key")
-                .font(.system(size: 15, weight: .semibold))
-
-            SecureField("sk-...", text: $draftKey)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 13))
-                .onSubmit { save() }
-
-            if showInvalidMessage {
-                Text("请输入 API Key，支持直接粘贴 sk-... 或 Authorization: Bearer sk-...")
-                    .font(.system(size: 12))
-                    .foregroundColor(.red)
-            }
-
-            HStack {
-                Spacer()
-                Button("取消") { onCancel() }
-                    .keyboardShortcut(.cancelAction)
-                Button("保存并刷新") { save() }
-                    .keyboardShortcut(.defaultAction)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-            }
-        }
-        .padding(18)
-        .frame(width: 420)
-    }
-
-    private func save() {
-        let trimmed = draftKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            showInvalidMessage = true
-            return
-        }
-        showInvalidMessage = false
-        onSave(trimmed)
-    }
-}

@@ -3,9 +3,9 @@ set -e
 
 cd "$(dirname "$0")"
 
-APP_NAME="MergeSASE"
+APP_NAME="MergeSASE&OpenVPN"
 BUNDLE_DIR="$APP_NAME.app"
-EXECUTABLE="$APP_NAME"
+EXECUTABLE="MergeSASE"
 
 echo "=== Building $APP_NAME ==="
 
