@@ -18,7 +18,7 @@ xattr -cr（把app直接拖到终端里）
 
 https://github.com/wangziheng2211222/MergeSASE/releases
 
-下载最新版本里的 `MergeSASE&OpenVPN.zip`，解压后双击 `MergeSASE&OpenVPN.app` → 点击「一键启动」。
+下载最新版本里的 `MergeSASE-OpenVPN.zip`，解压后双击 `MergeSASE&OpenVPN.app` → 点击「一键启动」。
 
 如果 macOS 提示应用损坏或无法打开，执行：
 
@@ -55,7 +55,7 @@ cp -R "MergeSASE&OpenVPN.app" /Applications/
 bash clash-sase-fix.command
 ```
 
-> 注意：GitHub 页面右上角的「Code → Download ZIP」下载的是源码压缩包，不是已打包好的 App。普通用户想直接安装，请下载 Releases 里的 `MergeSASE&OpenVPN.zip`。
+> 注意：GitHub 页面右上角的「Code → Download ZIP」下载的是源码压缩包，不是已打包好的 App。普通用户想直接安装，请下载 Releases 里的 `MergeSASE-OpenVPN.zip`。
 
 ### 发布安装包给用户
 
@@ -64,7 +64,7 @@ bash clash-sase-fix.command
 ```bash
 cd MergeSASE
 bash build.sh
-ditto -c -k --keepParent "MergeSASE&OpenVPN.app" "../MergeSASE&OpenVPN.zip"
+COPYFILE_DISABLE=1 ditto -c -k --norsrc --keepParent "MergeSASE&OpenVPN.app" "../MergeSASE-OpenVPN.zip"
 ```
 
 ## 本次修复说明
