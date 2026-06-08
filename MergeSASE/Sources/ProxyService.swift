@@ -858,95 +858,113 @@ final class ProxyService: ObservableObject {
         developerBalanceStatus = .loading
         developerBalanceSummary = "查询中"
 
-        var request = URLRequest(url: developerBalanceAPIURL)
-        request.httpMethod = "GET"
-        request.timeoutInterval = 12
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue("Bearer \(requestToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("MergeSASE/1.0", forHTTPHeaderField: "User-Agent")
+        let result = await performDeveloperBalanceRequest(token: requestToken)
+        guard requestToken == bearerToken(from: activeAPIKey ?? "") else { return }
 
-        do {
-            let (data, response) = try await performDeveloperBalanceRequest(request)
-            guard requestToken == bearerToken(from: activeAPIKey ?? "") else { return }
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        switch result {
+        case .success(let data, let statusCode, let transport):
             guard statusCode != 401 && statusCode != 403 else {
                 developerBalanceStatus = .unauthorized
                 developerBalanceSummary = "Key 无效"
-                log("余额查询鉴权失败: HTTP \(statusCode)\(developerBalanceMessageSuffix(data))", .warn)
+                log("余额查询鉴权失败: HTTP \(statusCode)\(developerBalanceMessageSuffix(data)) [\(transport)]", .warn)
                 return
             }
             guard (200..<300).contains(statusCode) else {
                 developerBalanceStatus = .error
                 developerBalanceSummary = "查询失败"
-                log("余额查询失败: HTTP \(statusCode)\(developerBalanceMessageSuffix(data))", .warn)
+                log("余额查询失败: HTTP \(statusCode)\(developerBalanceMessageSuffix(data)) [\(transport)]", .warn)
                 return
             }
 
             if let amount = parseDeveloperBalanceAmount(data) {
                 developerBalanceStatus = .ok
                 developerBalanceSummary = "$\(String(format: "%.2f", amount))"
+                log("余额查询成功 [\(transport)]", .success)
             } else {
                 developerBalanceStatus = .error
                 developerBalanceSummary = "解析失败"
                 log("余额查询响应未识别余额字段\(developerBalanceTopLevelKeysSuffix(data))", .warn)
             }
-        } catch {
+        case .failure(let errorMessage):
             developerBalanceStatus = .error
             developerBalanceSummary = "查询失败"
-            log("余额查询网络失败: \(error.localizedDescription)", .warn)
+            log("余额查询网络失败: \(errorMessage)", .warn)
         }
     }
 
-    private func performDeveloperBalanceRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
-        var configs: [URLSessionConfiguration] = [developerBalanceURLSessionConfiguration(proxy: nil)]
+    private enum DeveloperBalanceRequestResult {
+        case success(data: Data, statusCode: Int, transport: String)
+        case failure(String)
+    }
+
+    private func performDeveloperBalanceRequest(token: String) async -> DeveloperBalanceRequestResult {
         let host = proxyHost.isEmpty ? "127.0.0.1" : proxyHost
+        var attempts: [(label: String, proxyURL: String?)] = []
         if externalProxyRunning || systemProxyEnabled {
-            configs.append(developerBalanceURLSessionConfiguration(proxy: (host, clashPort)))
+            attempts.append(("代理 \(host):\(clashPort)", "http://\(host):\(clashPort)"))
+        }
+        attempts.append(("直接连接", nil))
+
+        var lastError = ""
+        var firstHTTPFailure: DeveloperBalanceRequestResult?
+        for attempt in attempts {
+            let result = await developerBalanceCurl(token: token, proxyURL: attempt.proxyURL)
+            guard result.exitCode == 0 else {
+                lastError = result.stderr.isEmpty ? "curl exit \(result.exitCode)" : result.stderr
+                continue
+            }
+
+            let parts = result.stdout.components(separatedBy: "\n__MERGESASE_HTTP_CODE__:")
+            guard parts.count >= 2,
+                  let statusLine = parts.last?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let statusCode = Int(statusLine)
+            else {
+                lastError = "余额接口响应缺少 HTTP 状态码"
+                continue
+            }
+
+            let bodyText = parts.dropLast().joined(separator: "\n__MERGESASE_HTTP_CODE__:")
+            let data = Data(bodyText.utf8)
+            if !(200..<300).contains(statusCode) {
+                if firstHTTPFailure == nil {
+                    firstHTTPFailure = .success(data: data, statusCode: statusCode, transport: attempt.label)
+                }
+                continue
+            }
+            return .success(data: data, statusCode: statusCode, transport: attempt.label)
         }
 
-        var lastError: Error?
-        var directFailureResponse: (Data, URLResponse)?
-        for (index, config) in configs.enumerated() {
-            config.waitsForConnectivity = true
-            let session = URLSession(configuration: config)
-            do {
-                let result = try await session.data(for: request)
-                session.finishTasksAndInvalidate()
-                let statusCode = (result.1 as? HTTPURLResponse)?.statusCode ?? 0
-                if index == 0, configs.count > 1, !(200..<300).contains(statusCode) {
-                    directFailureResponse = result
-                    continue
-                }
-                return result
-            } catch {
-                session.invalidateAndCancel()
-                lastError = error
-                try? await Task.sleep(nanoseconds: 500_000_000)
-            }
+        if let firstHTTPFailure {
+            return firstHTTPFailure
         }
-        if let directFailureResponse {
-            return directFailureResponse
-        }
-        throw lastError ?? URLError(.unknown)
+        return .failure(lastError.isEmpty ? "curl 未返回结果" : lastError)
     }
 
-    private func developerBalanceURLSessionConfiguration(proxy: (host: String, port: Int)?) -> URLSessionConfiguration {
-        let config = URLSessionConfiguration.ephemeral
-        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        config.timeoutIntervalForRequest = 12
-        config.timeoutIntervalForResource = 18
-        if let proxy {
-            config.connectionProxyDictionary = [
-                kCFNetworkProxiesHTTPEnable as String: true,
-                kCFNetworkProxiesHTTPProxy as String: proxy.host,
-                kCFNetworkProxiesHTTPPort as String: proxy.port,
-                kCFNetworkProxiesHTTPSEnable as String: true,
-                kCFNetworkProxiesHTTPSProxy as String: proxy.host,
-                kCFNetworkProxiesHTTPSPort as String: proxy.port
-            ]
+    private func developerBalanceCurl(token: String, proxyURL: String?) async -> CommandResult {
+        var args = [
+            "-u", "ALL_PROXY",
+            "-u", "all_proxy",
+            "-u", "HTTPS_PROXY",
+            "-u", "https_proxy",
+            "-u", "HTTP_PROXY",
+            "-u", "http_proxy",
+            "-u", "NO_PROXY",
+            "-u", "no_proxy",
+            "/usr/bin/curl",
+            "-sS",
+            "-L",
+            "--connect-timeout", "8",
+            "--max-time", "20",
+            "-H", "Authorization: Bearer \(token)",
+            "-H", "Accept: application/json",
+            "-H", "User-Agent: MergeSASE/1.0",
+            "-w", "\n__MERGESASE_HTTP_CODE__:%{http_code}"
+        ]
+        if let proxyURL {
+            args.append(contentsOf: ["--proxy", proxyURL])
         }
-        return config
+        args.append(developerBalanceAPIURL.absoluteString)
+        return await CommandRunner.run("/usr/bin/env", args)
     }
 
     private func bearerToken(from value: String) -> String {
