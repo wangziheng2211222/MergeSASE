@@ -30,6 +30,7 @@ require_command() {
 download_latest_release() {
     local dest="$1"
     local url
+    local fallback_url="https://raw.githubusercontent.com/${REPO}/main/${ZIP_NAME}"
     if [ -n "$ZIP_URL" ]; then
         url="$ZIP_URL"
     elif [ "$VERSION" = "latest" ]; then
@@ -38,10 +39,20 @@ download_latest_release() {
         url="https://github.com/${REPO}/releases/download/${VERSION}/${ZIP_NAME}"
     fi
     log "下载安装包: ${url}"
-    if ! curl -fL --connect-timeout 15 --max-time 300 -o "$dest" "$url"; then
-        err "下载失败。请确认 GitHub Releases 已上传 ${ZIP_NAME}"
-        exit 1
+    if curl -fL --connect-timeout 15 --max-time 300 -o "$dest" "$url"; then
+        return
     fi
+
+    if [ -z "$ZIP_URL" ]; then
+        warn "GitHub Releases 下载失败，尝试备用下载源"
+        log "下载安装包: ${fallback_url}"
+        if curl -fL --connect-timeout 15 --max-time 300 -o "$dest" "$fallback_url"; then
+            return
+        fi
+    fi
+
+    err "下载失败。请稍后重试，或手动下载 https://github.com/${REPO}/raw/main/${ZIP_NAME}"
+    exit 1
 }
 
 copy_app() {
