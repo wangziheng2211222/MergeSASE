@@ -1298,7 +1298,7 @@ final class ProxyService: ObservableObject {
         await patchClashDNSConfig()
         await patchGeneratedClashConfig()
         // Reload Clash config via API
-        await reloadClashConfig(port: port)
+        await reloadClashConfig(port: port, mergeConfigWritten: written)
     }
 
     private func patchClashDNSConfig() async {
@@ -1400,7 +1400,7 @@ final class ProxyService: ObservableObject {
         }
     }
 
-    private func reloadClashConfig(port: Int) async {
+    private func reloadClashConfig(port: Int, mergeConfigWritten: Bool) async {
         var reloaded = false
 
         // Method 1: SIGHUP to mihomo process
@@ -1463,7 +1463,11 @@ final class ProxyService: ObservableObject {
         }
 
         if !reloaded {
-            log("请在 Clash Verge 中手动点击「重载配置」使 route-exclude 生效", .warn)
+            if mergeConfigWritten {
+                log("Clash 合并配置已写入；未确认热重载结果，Clash Verge 会自动读取 merge 配置，无需手动重载", .info)
+            } else {
+                log("未找到 Clash Verge merge 配置目录，请手动将 Merge.yaml 导入 Clash Verge", .warn)
+            }
         }
 
         // Small delay for config to take effect
