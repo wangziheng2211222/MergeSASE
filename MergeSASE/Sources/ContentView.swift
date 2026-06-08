@@ -33,11 +33,11 @@ struct ContentView: View {
                     }
                     .overlayScrollIndicators()
                     .scrollContentBackground(.hidden)
-                    .background(bgGray)
+                    .background(appBg)
                 }
 
                 VStack(spacing: 0) {
-                    Rectangle().fill(.primary.opacity(0.06)).frame(height: 1)
+                    Rectangle().fill(separatorColor).frame(height: 1)
                     heroAction
                         .padding(.horizontal, 14)
                         .padding(.top, 12)
@@ -46,7 +46,7 @@ struct ContentView: View {
                         .padding(.horizontal, 14)
                         .padding(.bottom, 10)
                 }
-                .background(bgGray)
+                .background(appBg)
             }
 
             if let suggestion = svc.browserSuggestion {
@@ -63,7 +63,7 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 280, idealWidth: 300, minHeight: 380, idealHeight: 460)
-        .background(bgGray)
+        .background(appBg)
         .animation(.spring(response: 0.22, dampingFraction: 0.86), value: svc.browserSuggestion)
         .onAppear {
             Task { await svc.checkNetworksOnLaunch() }
@@ -243,7 +243,7 @@ struct ContentView: View {
     }
 
     private var sep: some View {
-        Rectangle().fill(.primary.opacity(0.06)).frame(height: 1).padding(.leading, 28)
+        Rectangle().fill(separatorColor).frame(height: 1).padding(.leading, 28)
     }
 
     // MARK: - Network Card
@@ -477,7 +477,11 @@ struct ContentView: View {
                     .padding(.vertical, 7)
                     .padding(.horizontal, 10)
                     .frame(minHeight: 42)
-                    .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+                    .background(fieldBg, in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(separatorColor.opacity(0.35), lineWidth: 0.5)
+                    )
                     .contentShape(RoundedRectangle(cornerRadius: 7))
                     .onTapGesture {
                         domainFieldFocused = true
@@ -710,7 +714,11 @@ struct APIKeyTextRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 9)
         .padding(.horizontal, 10)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+        .background(fieldBg, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(separatorColor.opacity(0.35), lineWidth: 0.5)
+        )
     }
 }
 
@@ -749,14 +757,18 @@ struct SetupChecklistRow: View {
                         .foregroundColor(isPrimary ? .white : .blue)
                         .frame(minWidth: isPrimary ? 76 : 62, minHeight: 28)
                         .padding(.horizontal, 3)
-                        .background(isPrimary ? Color.blue : Color.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 6))
+                        .background(isPrimary ? Color.blue : Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
             }
         }
         .padding(.vertical, 10)
         .padding(.horizontal, 10)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+        .background(fieldBg, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .stroke(separatorColor.opacity(0.35), lineWidth: 0.5)
+        )
     }
 }
 
@@ -773,14 +785,22 @@ extension View {
         self
             .padding(12)
             .background(cardBg, in: RoundedRectangle(cornerRadius: 8))
-            .shadow(color: .primary.opacity(0.04), radius: 2, y: 1)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(separatorColor.opacity(0.35), lineWidth: 0.5)
+            )
+            .shadow(color: .black.opacity(0.08), radius: 2, y: 1)
     }
 
     func prominentCard() -> some View {
         self
             .padding(16)
             .background(cardBg, in: RoundedRectangle(cornerRadius: 10))
-            .shadow(color: .primary.opacity(0.05), radius: 4, y: 2)
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(separatorColor.opacity(0.35), lineWidth: 0.5)
+            )
+            .shadow(color: .black.opacity(0.10), radius: 4, y: 2)
     }
 
     func setupCard() -> some View {
@@ -789,9 +809,9 @@ extension View {
             .background(cardBg, in: RoundedRectangle(cornerRadius: 8))
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.blue.opacity(0.2), lineWidth: 1)
+                    .stroke(Color.accentColor.opacity(0.35), lineWidth: 1)
             )
-            .shadow(color: .primary.opacity(0.05), radius: 4, y: 2)
+            .shadow(color: .black.opacity(0.10), radius: 4, y: 2)
     }
 }
 
@@ -819,5 +839,7 @@ private struct OverlayScrollIndicatorConfigurator: NSViewRepresentable {
 }
 
 private let timeF: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
-private let bgGray = Color(red: 0.95, green: 0.95, blue: 0.94)
+private let appBg = Color(nsColor: .controlBackgroundColor)
 private let cardBg = Color(nsColor: .windowBackgroundColor)
+private let fieldBg = Color(nsColor: .controlBackgroundColor)
+private let separatorColor = Color(nsColor: .separatorColor).opacity(0.55)
