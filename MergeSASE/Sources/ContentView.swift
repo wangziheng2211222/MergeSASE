@@ -393,6 +393,21 @@ struct ContentView: View {
                         onFocus: { focusedAPIKeyIndex = 0 },
                         onChange: { svc.updateAPIKey($0) }
                     )
+                    HStack(alignment: .center, spacing: 8) {
+                        Text("填写 limayao API Key，可在开发者后台复制。")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary.opacity(0.65))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                        Spacer(minLength: 4)
+                        Button {
+                            NSWorkspace.shared.open(URL(string: "https://ai.limayao.com/developer")!)
+                        } label: {
+                            Label("打开后台", systemImage: "arrow.up.right.square")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .buttonStyle(.borderless)
+                    }
                 }
                 .padding(.top, 1)
             }

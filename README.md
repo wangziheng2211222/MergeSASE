@@ -91,6 +91,7 @@ COPYFILE_DISABLE=1 ditto -c -k --norsrc --keepParent "MergeSASE&OpenVPN.app" "..
 
 - App 不再提供独立的「配置 Key」按钮，展开「余额查询」区域后可以直接编辑一个 API Key。
 - App 不再显示刷新余额、删除 Key 等操作按钮。
+- 余额查询需要填写 limayao API Key，用户可以在 `https://ai.limayao.com/developer` 复制 Key。
 - 余额接口固定使用 `https://ai-platform-cicada-llm-api.limayao.com/api/usage/token/balance`，不暴露给用户配置。
 - 填写 Key 后，App 会自动读取并显示余额。
 
