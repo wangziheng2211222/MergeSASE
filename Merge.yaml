@@ -7,8 +7,12 @@ dns:
   fake-ip-filter-mode: blacklist
   fake-ip-filter:
     - '+.company.internal'
+    - '+.cds8.cn'
+    - '+.limayao.com'
   nameserver-policy:
     '+.company.internal': system
+    '+.cds8.cn': system
+    '+.limayao.com': system
 
 tun:
   enable: true

@@ -8,11 +8,29 @@ xattr -cr（把app直接拖到终端里）
 
 注意想要让自己的公司内部网络生效，需要先连接 SASE 或 OpenVPN Connect，并在公司域名那边添加下自己公司的域名，xxxx.com
 
+App 会默认加入 `cds8.cn` 和 `limayao.com` 作为公司内网排除域名，你仍然可以在界面里增删自己的公司域名。
+
 > 注意：`api.company.internal` 解析到公司 VPN 内网地址，ccswitch/Codex 等应用需要直连它。MergeSASE&OpenVPN 会把这个精确 host 写进 `NO_PROXY/no_proxy`，并清理 `ALL_PROXY/all_proxy`，避免内网请求被强制兜底送入 Clash。
 
 ## 快速开始
 
-### 方式一：从 GitHub Releases 下载安装（推荐给普通用户）
+### 方式一：终端一键安装（推荐给普通用户）
+
+在终端执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wangziheng2211222/MergeSASE/main/install.sh | bash
+```
+
+脚本会自动下载最新版本、安装到 `/Applications/MergeSASE&OpenVPN.app`、清除隔离属性并启动 App。
+
+如果要安装指定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wangziheng2211222/MergeSASE/main/install.sh | VERSION=v1.6 bash
+```
+
+### 方式二：从 GitHub Releases 下载安装
 
 打开仓库的 Releases 页面：
 
@@ -34,7 +52,7 @@ open "MergeSASE&OpenVPN.app"
 - 运行态识别 `verge-mihomo` / Clash Verge service，避免 Clash 实际运行但界面误报“未运行”
 - 实时状态监控、网络连通性检测、域名管理、日志查看
 
-### 方式二：从源码构建
+### 方式三：从源码构建
 
 ```bash
 git clone https://github.com/wangziheng2211222/MergeSASE.git
@@ -49,7 +67,7 @@ open "MergeSASE&OpenVPN.app"
 cp -R "MergeSASE&OpenVPN.app" /Applications/
 ```
 
-### 方式三：命令行脚本
+### 方式四：命令行脚本
 
 ```bash
 bash clash-sase-fix.command
@@ -159,7 +177,7 @@ cd MergeSASE
 bash build.sh
 ```
 
-需要 macOS 14+ 及 Xcode 15+。
+需要 macOS 13+ 及 Xcode 15+。
 
 ## 排查问题
 

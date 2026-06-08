@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 struct ContentView: View {
-    @Bindable var svc: ProxyService
+    @ObservedObject var svc: ProxyService
     @State private var refreshTimer: Timer?
     @State private var showLog = false
     @State private var showDomainEditor = false
@@ -74,15 +74,15 @@ struct ContentView: View {
         .onDisappear {
             refreshTimer?.invalidate(); refreshTimer = nil
         }
-        .onChange(of: svc.externalProxyPreference) { _, _ in
+        .onChange(of: svc.externalProxyPreference) { _ in
             Task { await svc.refreshStatus() }
         }
-        .onChange(of: svc.hasConfiguredCompanyDomain) { _, configured in
+        .onChange(of: svc.hasConfiguredCompanyDomain) { configured in
             if configured {
                 setupChecklistHiddenForSession = false
             }
         }
-        .onChange(of: svc.hasConfiguredAPIKey) { _, configured in
+        .onChange(of: svc.hasConfiguredAPIKey) { configured in
             if configured {
                 setupChecklistHiddenForSession = false
             }
@@ -146,8 +146,8 @@ struct ContentView: View {
                 actionBtn("停止中…", icon: nil, tint: Color(.systemRed), loading: true) {}
             case .error:
                 VStack(spacing: 6) {
-                    actionBtn("重试", icon: "arrow.clockwise", tint: .orange) { Task { await svc.retry() } }
-                    secondaryBtn("强制停止", icon: "stop.fill") { Task { await svc.stop() } }
+                    actionBtn("中止并还原", icon: "stop.fill", tint: Color(.systemGray)) { Task { await svc.stop() } }
+                    secondaryBtn("重试", icon: "arrow.clockwise") { Task { await svc.retry() } }
                 }
             case .idle, .running:
                 if svc.guardEffectivelyRunning {
@@ -176,7 +176,7 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity).padding(.vertical, 2)
         }
-        .buttonStyle(.borderedProminent).controlSize(.extraLarge).tint(tint)
+        .buttonStyle(.borderedProminent).controlSize(.large).tint(tint)
         .disabled(loading || disabled)
         .help(disabled ? "请先在新手引导里添加公司域名" : "")
     }
@@ -523,7 +523,7 @@ struct ContentView: View {
                     }
                     .overlayScrollIndicators()
                     .frame(maxHeight: 130)
-                    .onChange(of: svc.logs.count) { _, _ in
+                    .onChange(of: svc.logs.count) { _ in
                         if let last = svc.logs.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
                     }
                 }

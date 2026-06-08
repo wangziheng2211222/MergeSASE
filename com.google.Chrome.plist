@@ -9,7 +9,7 @@
         <key>ProxyServer</key>
         <string>http://127.0.0.1:7897</string>
         <key>ProxyBypassList</key>
-        <string>*.company.internal;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16;127.0.0.1;localhost;*.local</string>
+        <string>*.company.internal;cds8.cn;*.cds8.cn;limayao.com;*.limayao.com;10.0.0.0/8;172.16.0.0/12;192.168.0.0/16;127.0.0.1;localhost;*.local</string>
     </dict>
     <key>DnsOverHttpsMode</key>
     <string>off</string>

@@ -57,6 +57,8 @@ CLASH_HOST="127.0.0.1"
 # ---- 公司内部域名（按需添加）----
 COMPANY_DOMAINS=(
     "company.internal"
+    "cds8.cn"
+    "limayao.com"
 )
 DIRECT_COMPANY_HOSTS=(
     "developer.company.internal"
@@ -117,6 +119,10 @@ BYPASS=(
     "197.19.0.0/16"
     "company.internal"
     "*.company.internal"
+    "cds8.cn"
+    "*.cds8.cn"
+    "limayao.com"
+    "*.limayao.com"
     "\${DIRECT_COMPANY_HOSTS[@]}"
 )
 
@@ -167,7 +173,7 @@ log "launchd 配置已写入: $PLIST_PATH"
 BYPASS_ARGS=(
     "127.0.0.1" "localhost" "*.local" "169.254.0.0/16"
     "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "197.19.0.0/16"
-    "company.internal" "*.company.internal" "${DIRECT_COMPANY_HOSTS[@]}"
+    "company.internal" "*.company.internal" "cds8.cn" "*.cds8.cn" "limayao.com" "*.limayao.com" "${DIRECT_COMPANY_HOSTS[@]}"
 )
 
 while IFS= read -r service; do
@@ -183,7 +189,7 @@ log "系统代理已设置为 ${CLASH_HOST}:${CLASH_PORT}"
 # ccswitch 等非浏览器应用通常读取 launchd 环境变量。
 # 额外写入精确 API host，兼容不识别 *.company.internal 的客户端。
 PROXY_URL="http://${CLASH_HOST}:${CLASH_PORT}"
-NO_PROXY_VALUE="localhost,127.0.0.1,::1,.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,197.19.0.0/16,company.internal,.company.internal,*.company.internal,developer.company.internal,api.company.internal"
+NO_PROXY_VALUE="localhost,127.0.0.1,::1,.local,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,197.19.0.0/16,company.internal,.company.internal,*.company.internal,cds8.cn,.cds8.cn,*.cds8.cn,limayao.com,.limayao.com,*.limayao.com,developer.company.internal,api.company.internal"
 for key in HTTP_PROXY http_proxy HTTPS_PROXY https_proxy; do
     launchctl setenv "$key" "$PROXY_URL"
 done

@@ -3,7 +3,7 @@ import AppKit
 
 @main
 struct MergeSASEApp: App {
-    @State private var svc = ProxyService()
+    @StateObject private var svc = ProxyService()
 
     var body: some Scene {
         WindowGroup("MergeSASE&OpenVPN", id: "main") {
@@ -21,7 +21,7 @@ struct MergeSASEApp: App {
 }
 
 struct MenuBarBalanceMenu: View {
-    @Bindable var svc: ProxyService
+    @ObservedObject var svc: ProxyService
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {

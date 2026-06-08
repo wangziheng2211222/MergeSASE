@@ -1,5 +1,5 @@
 import Foundation
-import Observation
+import Combine
 
 enum AppPhase: String { case idle, starting, running, stopping, error }
 
@@ -87,47 +87,46 @@ enum DeveloperBalanceStatus {
 }
 
 @MainActor
-@Observable
-final class ProxyService {
-    var phase: AppPhase = .idle
-    var clashRunning = false
-    var clashPort: Int = 7897
-    var systemProxyEnabled = false
-    var proxyHost: String = "127.0.0.1"
-    var externalProxyPreference: ExternalProxyPreference {
+final class ProxyService: ObservableObject {
+    @Published var phase: AppPhase = .idle
+    @Published var clashRunning = false
+    @Published var clashPort: Int = 7897
+    @Published var systemProxyEnabled = false
+    @Published var proxyHost: String = "127.0.0.1"
+    @Published var externalProxyPreference: ExternalProxyPreference {
         didSet { UserDefaults.standard.set(externalProxyPreference.rawValue, forKey: "externalProxyPreference") }
     }
-    var externalProxyName = "未检测"
-    var externalProxyDetail = "请选择 Clash 或 Shadowrocket"
-    var externalProxyRunning = false
-    var externalProxySupportsClashConfig = false
-    var vpnClientName = "未检测"
-    var vpnClientDetail = "请先连接 SASE 或 OpenVPN Connect"
-    var vpnClientRunning = false
-    var guardLoaded = false
-    var chromePolicyInstalled = false
-    var appEnvFixed = false
-    var networkCheckInProgress = false
-    var internalResult = NetworkCheckResult()
-    var externalResult = NetworkCheckResult()
-    var logs: [LogLine] = []
-    var companyDomains: [String] {
+    @Published var externalProxyName = "未检测"
+    @Published var externalProxyDetail = "请选择 Clash 或 Shadowrocket"
+    @Published var externalProxyRunning = false
+    @Published var externalProxySupportsClashConfig = false
+    @Published var vpnClientName = "未检测"
+    @Published var vpnClientDetail = "请先连接 SASE 或 OpenVPN Connect"
+    @Published var vpnClientRunning = false
+    @Published var guardLoaded = false
+    @Published var chromePolicyInstalled = false
+    @Published var appEnvFixed = false
+    @Published var networkCheckInProgress = false
+    @Published var internalResult = NetworkCheckResult()
+    @Published var externalResult = NetworkCheckResult()
+    @Published var logs: [LogLine] = []
+    @Published var companyDomains: [String] {
         didSet { UserDefaults.standard.set(companyDomains, forKey: "companyDomains") }
     }
-    var setupChecklistDismissed: Bool {
+    @Published var setupChecklistDismissed: Bool {
         didSet { UserDefaults.standard.set(setupChecklistDismissed, forKey: "setupChecklistDismissed") }
     }
-    var statusMessage: String = "就绪"
-    var browserSuggestion: String?
-    var newDomain: String = ""
-    var apiKeys: [String] {
+    @Published var statusMessage: String = "就绪"
+    @Published var browserSuggestion: String?
+    @Published var newDomain: String = ""
+    @Published var apiKeys: [String] {
         didSet {
             UserDefaults.standard.set(apiKeys, forKey: "apiKeys")
             scheduleDeveloperBalanceRefresh()
         }
     }
-    var developerBalanceStatus: DeveloperBalanceStatus = .unconfigured
-    var developerBalanceSummary: String = "未配置"
+    @Published var developerBalanceStatus: DeveloperBalanceStatus = .unconfigured
+    @Published var developerBalanceSummary: String = "未配置"
     var menuBarTitle: String {
         developerBalanceSummary
     }
@@ -171,6 +170,7 @@ final class ProxyService {
     private let managedAllProxyKeys = ["ALL_PROXY", "all_proxy"]
     private let managedNoProxyKeys = ["NO_PROXY", "no_proxy"]
     private var managedEnvKeys: [String] { managedProxyKeys + managedAllProxyKeys + managedNoProxyKeys }
+    private static let defaultCompanyDomains = ["cds8.cn", "limayao.com"]
     private let proxyRequiredHosts: [String] = []
     private var directCompanyHosts: [String] {
         ["developer.company.internal", "api.company.internal", "ai-platform-cicada-llm-api.limayao.com"]
@@ -180,16 +180,21 @@ final class ProxyService {
     private let developerBalanceAutoRefreshInterval: UInt64 = 60_000_000_000
     private var developerBalanceRefreshTask: Task<Void, Never>?
     private var developerBalanceAutoRefreshTask: Task<Void, Never>?
+    private var startupFailureCleanupCompleted = false
 
     init() {
         let savedProxyPreference = UserDefaults.standard.string(forKey: "externalProxyPreference") ?? ExternalProxyPreference.auto.rawValue
         self.externalProxyPreference = ExternalProxyPreference(rawValue: savedProxyPreference) ?? .auto
 
         let saved = UserDefaults.standard.stringArray(forKey: "companyDomains") ?? []
-        if saved.isEmpty {
-            self.companyDomains = []
+        let defaultsSeededKey = "defaultCompanyDomainsSeeded"
+        if UserDefaults.standard.bool(forKey: defaultsSeededKey) {
+            self.companyDomains = Self.deduplicatedDomains(saved)
         } else {
-            self.companyDomains = saved
+            let seededDomains = Self.deduplicatedDomains(Self.defaultCompanyDomains + saved)
+            self.companyDomains = seededDomains
+            UserDefaults.standard.set(seededDomains, forKey: "companyDomains")
+            UserDefaults.standard.set(true, forKey: defaultsSeededKey)
         }
         self.apiKeys = UserDefaults.standard.stringArray(forKey: "apiKeys") ?? []
         self.setupChecklistDismissed = UserDefaults.standard.bool(forKey: "setupChecklistDismissed")
@@ -202,6 +207,19 @@ final class ProxyService {
     private func log(_ text: String, _ level: LogLevel = .info) {
         logs.append(LogLine(timestamp: Date(), text: text, level: level))
         if logs.count > 500 { logs.removeFirst(100) }
+    }
+
+    private static func deduplicatedDomains(_ domains: [String]) -> [String] {
+        var seen = Set<String>()
+        return domains.compactMap { value in
+            let domain = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .replacingOccurrences(of: "*.", with: "")
+                .replacingOccurrences(of: "+.", with: "")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            guard !domain.isEmpty, seen.insert(domain).inserted else { return nil }
+            return domain
+        }
     }
 
     private func suggestBrowserAction(_ text: String) {
@@ -661,14 +679,121 @@ final class ProxyService {
         return true
     }
 
+    private func cleanupManagedConfigurationWithoutSnapshot(plistPath: String, guardScript: String) async {
+        let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
+        let services = svcResult.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
+        for service in services {
+            let trimmed = service.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("An asterisk") { continue }
+            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setwebproxystate", trimmed, "off"])
+            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsecurewebproxystate", trimmed, "off"])
+            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", trimmed, "off"])
+        }
+        systemProxyEnabled = false
+        log("未找到启动前快照，已执行清理式系统代理关闭", .warn)
+
+        for key in managedEnvKeys {
+            _ = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
+        }
+        appEnvFixed = false
+        log("已清理 HTTP_PROXY/NO_PROXY 等应用环境变量", .info)
+
+        _ = await CommandRunner.run("/usr/bin/defaults", ["delete", "\(homeDir)/Library/Preferences/com.google.Chrome.plist", "ProxySettings"])
+        try? FileManager.default.removeItem(atPath: "\(homeDir)/Library/Application Support/Google/Chrome/Managed/com.google.Chrome.plist")
+        chromePolicyInstalled = false
+        log("Chrome 策略已移除", .success)
+
+        let mergePaths = [
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/merge.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/merge.yaml",
+        ]
+        for path in mergePaths {
+            if FileManager.default.fileExists(atPath: path) {
+                try? FileManager.default.removeItem(atPath: path)
+                log("已清理 merge 配置: \((path as NSString).lastPathComponent)", .success)
+            }
+        }
+
+        try? FileManager.default.removeItem(atPath: plistPath)
+        try? FileManager.default.removeItem(atPath: guardScript)
+        guardLoaded = false
+        log("配置文件已清理", .info)
+    }
+
+    private func restoreOrCleanupManagedConfiguration(plistPath: String, guardScript: String) async -> Bool {
+        let restoredFromSnapshot = await restoreStartupSnapshot()
+        if !restoredFromSnapshot {
+            await cleanupManagedConfigurationWithoutSnapshot(plistPath: plistPath, guardScript: guardScript)
+        }
+        return restoredFromSnapshot
+    }
+
+    private func reloadClashAfterRestore() async {
+        let sighupRes = await CommandRunner.runShell("kill -HUP $(pgrep -f mihomo) 2>/dev/null")
+        if sighupRes.succeeded {
+            log("Clash 配置已重载（已恢复原始路由）", .success)
+            return
+        }
+
+        var secret = ""
+        let configPaths = [
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/config.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml",
+        ]
+        for path in configPaths {
+            guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            for line in content.components(separatedBy: "\n") {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("secret:") {
+                    secret = trimmed.replacingOccurrences(of: "secret:", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .replacingOccurrences(of: "'", with: "")
+                        .replacingOccurrences(of: "\"", with: "")
+                }
+            }
+            break
+        }
+        var authPart = ""
+        if !secret.isEmpty { authPart = "-H 'Authorization: Bearer \(secret)'" }
+        _ = await CommandRunner.runShell(
+            "curl -s -o /dev/null -X PUT 'http://127.0.0.1:9097/configs?force=true' -H 'Content-Type: application/json' \(authPart) -d '{}' 2>/dev/null"
+        )
+        log("Clash 配置已通过 API 重载", .info)
+    }
+
+    private func failStartAndRestore(_ reason: String) async {
+        log("启动失败: \(reason)", .error)
+        phase = .stopping
+        statusMessage = "启动失败，正在自动恢复…"
+
+        let plistPath = "\(homeDir)/Library/LaunchAgents/com.clash.proxyguard.plist"
+        let guardScript = "\(homeDir)/.local/bin/clash-proxy-guard.sh"
+        _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
+        guardLoaded = false
+
+        let restoredFromSnapshot = await restoreOrCleanupManagedConfiguration(plistPath: plistPath, guardScript: guardScript)
+        await reloadClashAfterRestore()
+        await refreshStatus()
+        startupFailureCleanupCompleted = true
+        phase = .error
+        if restoredFromSnapshot {
+            statusMessage = "启动失败，已自动恢复"
+            log("========== 启动失败，已自动恢复 ==========", .warn)
+        } else {
+            statusMessage = "启动失败，已清理配置"
+            log("========== 启动失败，未找到快照，已执行清理式卸载 ==========", .warn)
+        }
+    }
+
     func addDomain(_ domain: String) {
-        let trimmed = domain.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, !companyDomains.contains(trimmed) else { return }
+        let trimmed = normalizedHost(domain)
+        guard !trimmed.isEmpty, !companyDomains.map(normalizedHost).contains(trimmed) else { return }
         companyDomains.append(trimmed)
     }
 
     func removeDomain(_ domain: String) {
-        companyDomains.removeAll { $0 == domain }
+        let trimmed = normalizedHost(domain)
+        companyDomains.removeAll { normalizedHost($0) == trimmed }
     }
 
     func dismissSetupChecklist() {
@@ -730,6 +855,9 @@ final class ProxyService {
             return
         }
 
+        developerBalanceStatus = .loading
+        developerBalanceSummary = "查询中"
+
         var request = URLRequest(url: developerBalanceAPIURL)
         request.httpMethod = "GET"
         request.timeoutInterval = 12
@@ -739,17 +867,19 @@ final class ProxyService {
         request.setValue("MergeSASE/1.0", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await performDeveloperBalanceRequest(request)
             guard requestToken == bearerToken(from: activeAPIKey ?? "") else { return }
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard statusCode != 401 && statusCode != 403 else {
                 developerBalanceStatus = .unauthorized
                 developerBalanceSummary = "Key 无效"
+                log("余额查询鉴权失败: HTTP \(statusCode)\(developerBalanceMessageSuffix(data))", .warn)
                 return
             }
             guard (200..<300).contains(statusCode) else {
                 developerBalanceStatus = .error
                 developerBalanceSummary = "查询失败"
+                log("余额查询失败: HTTP \(statusCode)\(developerBalanceMessageSuffix(data))", .warn)
                 return
             }
 
@@ -758,16 +888,79 @@ final class ProxyService {
                 developerBalanceSummary = "$\(String(format: "%.2f", amount))"
             } else {
                 developerBalanceStatus = .error
-                developerBalanceSummary = "查询失败"
+                developerBalanceSummary = "解析失败"
+                log("余额查询响应未识别余额字段\(developerBalanceTopLevelKeysSuffix(data))", .warn)
             }
         } catch {
             developerBalanceStatus = .error
             developerBalanceSummary = "查询失败"
+            log("余额查询网络失败: \(error.localizedDescription)", .warn)
         }
+    }
+
+    private func performDeveloperBalanceRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        var configs: [URLSessionConfiguration] = [developerBalanceURLSessionConfiguration(proxy: nil)]
+        let host = proxyHost.isEmpty ? "127.0.0.1" : proxyHost
+        if externalProxyRunning || systemProxyEnabled {
+            configs.append(developerBalanceURLSessionConfiguration(proxy: (host, clashPort)))
+        }
+
+        var lastError: Error?
+        var directFailureResponse: (Data, URLResponse)?
+        for (index, config) in configs.enumerated() {
+            config.waitsForConnectivity = true
+            let session = URLSession(configuration: config)
+            do {
+                let result = try await session.data(for: request)
+                session.finishTasksAndInvalidate()
+                let statusCode = (result.1 as? HTTPURLResponse)?.statusCode ?? 0
+                if index == 0, configs.count > 1, !(200..<300).contains(statusCode) {
+                    directFailureResponse = result
+                    continue
+                }
+                return result
+            } catch {
+                session.invalidateAndCancel()
+                lastError = error
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        if let directFailureResponse {
+            return directFailureResponse
+        }
+        throw lastError ?? URLError(.unknown)
+    }
+
+    private func developerBalanceURLSessionConfiguration(proxy: (host: String, port: Int)?) -> URLSessionConfiguration {
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        config.timeoutIntervalForRequest = 12
+        config.timeoutIntervalForResource = 18
+        if let proxy {
+            config.connectionProxyDictionary = [
+                kCFNetworkProxiesHTTPEnable as String: true,
+                kCFNetworkProxiesHTTPProxy as String: proxy.host,
+                kCFNetworkProxiesHTTPPort as String: proxy.port,
+                kCFNetworkProxiesHTTPSEnable as String: true,
+                kCFNetworkProxiesHTTPSProxy as String: proxy.host,
+                kCFNetworkProxiesHTTPSPort as String: proxy.port
+            ]
+        }
+        return config
     }
 
     private func bearerToken(from value: String) -> String {
         var token = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        for line in token.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+            if trimmed.lowercased().hasPrefix("authorization:") {
+                return bearerToken(from: trimmed)
+            }
+            if let bearerRange = trimmed.range(of: "bearer ", options: [.caseInsensitive]) {
+                return bearerToken(from: String(trimmed[bearerRange.lowerBound...]))
+            }
+        }
         if token.lowercased().hasPrefix("authorization:") {
             token = String(token.dropFirst("authorization:".count))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -776,6 +969,7 @@ final class ProxyService {
             token = String(token.dropFirst("bearer ".count))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        token = token.trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
         return token
     }
 
@@ -791,19 +985,72 @@ final class ProxyService {
             "remaining_balance",
             "available_balance",
             "remaining_quota",
+            "remaining",
+            "remain_quota",
+            "quota_remaining",
+            "available_quota",
+            "token_balance",
+            "balance_usd",
             "overflow_remaining_usd",
             "base_remaining_usd",
             "bonus_remaining_usd",
             "balance",
-            "quota"
+            "quota",
+            "amount",
+            "credit",
+            "credits"
         ]
 
         for key in preferredKeys {
             if let amount = findNumber(forKey: key, in: object) {
-                if key == "display_remaining_quota", amount > 10_000 {
+                if key.contains("quota"), amount > 10_000 {
                     return amount / 500_000
                 }
                 return amount
+            }
+        }
+        return nil
+    }
+
+    private func developerBalanceMessageSuffix(_ data: Data) -> String {
+        guard let object = try? JSONSerialization.jsonObject(with: data),
+              let message = findString(forKeys: ["message", "msg", "error", "detail"], in: object),
+              !message.isEmpty
+        else {
+            return ""
+        }
+        return "，\(message.prefix(120))"
+    }
+
+    private func developerBalanceTopLevelKeysSuffix(_ data: Data) -> String {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ""
+        }
+        let keys = object.keys.sorted().joined(separator: ", ")
+        return keys.isEmpty ? "" : "，顶层字段: \(keys)"
+    }
+
+    private func findString(forKeys targetKeys: Set<String>, in object: Any) -> String? {
+        if let dict = object as? [String: Any] {
+            for (key, value) in dict {
+                if targetKeys.contains(key.lowercased()) {
+                    if let string = value as? String {
+                        return string
+                    }
+                    if let number = value as? NSNumber {
+                        return number.stringValue
+                    }
+                }
+                if let found = findString(forKeys: targetKeys, in: value) {
+                    return found
+                }
+            }
+        }
+        if let array = object as? [Any] {
+            for value in array {
+                if let found = findString(forKeys: targetKeys, in: value) {
+                    return found
+                }
             }
         }
         return nil
@@ -1226,6 +1473,7 @@ final class ProxyService {
     // MARK: - Start
 
     func start() async {
+        startupFailureCleanupCompleted = false
         phase = .starting
         statusMessage = "启动中…"
         log("========== 开始启动 ==========")
@@ -1307,7 +1555,8 @@ final class ProxyService {
             log("守护脚本已写入", .success)
         } catch {
             log("守护脚本写入失败: \(error.localizedDescription)", .error)
-            phase = .error; statusMessage = "守护脚本写入失败"; return
+            await failStartAndRestore("守护脚本写入失败")
+            return
         }
 
         // Write launchd plist
@@ -1421,16 +1670,22 @@ final class ProxyService {
                 guardLoaded = true
             } else {
                 log("守护启动失败: \(loadRes.stderr.isEmpty ? "launchctl 未返回详细原因" : loadRes.stderr)", .warn)
-                log("已继续完成其余配置；如公司 VPN 后续清掉系统代理，请修复 LaunchAgents 权限后重试。", .warn)
                 guardLoaded = false
+                await failStartAndRestore("守护启动失败")
+                return
             }
         }
 
 
         await refreshStatus()
-        phase = systemProxyEnabled ? .running : .error
-        statusMessage = phase == .running ? (guardLoaded ? "运行中" : "已启动，守护未加载") : "部分异常"
-        log("========== 启动完成 ==========", phase == .running ? (guardLoaded ? .success : .warn) : .warn)
+        if systemProxyEnabled && guardLoaded {
+            phase = .running
+            statusMessage = "运行中"
+            log("========== 启动完成 ==========", .success)
+        } else {
+            await failStartAndRestore(systemProxyEnabled ? "守护未加载" : "系统代理未生效")
+            return
+        }
 
         if phase == .running {
             await checkInternalNetwork()
@@ -1453,77 +1708,14 @@ final class ProxyService {
         guardLoaded = false
         log("守护已停止", .success)
 
-        let restoredFromSnapshot = await restoreStartupSnapshot()
+        if startupFailureCleanupCompleted {
+            log("启动失败时已自动还原/清理，本次跳过重复清理", .info)
+        } else {
+            _ = await restoreOrCleanupManagedConfiguration(plistPath: plistPath, guardScript: guardScript)
 
-        if !restoredFromSnapshot {
-            // 2. Fallback: turn off the proxy and remove files managed by MergeSASE.
-            let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
-            let services = svcResult.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
-            for service in services {
-                let trimmed = service.trimmingCharacters(in: .whitespaces)
-                if trimmed.isEmpty || trimmed.hasPrefix("An asterisk") { continue }
-                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setwebproxystate", trimmed, "off"])
-                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsecurewebproxystate", trimmed, "off"])
-                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", trimmed, "off"])
-            }
-            systemProxyEnabled = false
-            log("未找到启动前快照，已执行清理式系统代理关闭", .warn)
-
-            for key in managedEnvKeys {
-                _ = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
-            }
-            log("已清理 HTTP_PROXY/NO_PROXY 等应用环境变量", .info)
-
-            _ = await CommandRunner.run("/usr/bin/defaults", ["delete", "\(homeDir)/Library/Preferences/com.google.Chrome.plist", "ProxySettings"])
-            try? FileManager.default.removeItem(atPath: "\(homeDir)/Library/Application Support/Google/Chrome/Managed/com.google.Chrome.plist")
-            chromePolicyInstalled = false
-            log("Chrome 策略已移除", .success)
-
-            let mergePaths = [
-                "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/merge.yaml",
-                "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/merge.yaml",
-            ]
-            for path in mergePaths {
-                if FileManager.default.fileExists(atPath: path) {
-                    try? FileManager.default.removeItem(atPath: path)
-                    log("已清理 merge 配置: \((path as NSString).lastPathComponent)", .success)
-                }
-            }
-
-            try? FileManager.default.removeItem(atPath: plistPath)
-            try? FileManager.default.removeItem(atPath: guardScript)
-            log("配置文件已清理", .info)
-        }
-
-        if externalProxySupportsClashConfig || externalProxyPreference != .shadowrocket {
-            // Reload Clash config after restoring or removing merge config.
-            let sighupRes = await CommandRunner.runShell("kill -HUP $(pgrep -f mihomo) 2>/dev/null")
-            if sighupRes.succeeded {
-                log("Clash 配置已重载（已恢复原始路由）", .success)
-            } else {
-                var secret = ""
-                let configPaths = [
-                    "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/config.yaml",
-                    "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml",
-                ]
-                for path in configPaths {
-                    guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
-                    for line in content.components(separatedBy: "\n") {
-                        let trimmed = line.trimmingCharacters(in: .whitespaces)
-                        if trimmed.hasPrefix("secret:") {
-                            secret = trimmed.replacingOccurrences(of: "secret:", with: "")
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                                .replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\"", with: "")
-                        }
-                    }
-                    break
-                }
-                var authPart = ""
-                if !secret.isEmpty { authPart = "-H 'Authorization: Bearer \(secret)'" }
-                _ = await CommandRunner.runShell(
-                    "curl -s -o /dev/null -X PUT 'http://127.0.0.1:9097/configs?force=true' -H 'Content-Type: application/json' \(authPart) -d '{}' 2>/dev/null"
-                )
-                log("Clash 配置已通过 API 重载", .info)
+            if externalProxySupportsClashConfig || externalProxyPreference != .shadowrocket {
+                // Reload Clash config after restoring or removing merge config.
+                await reloadClashAfterRestore()
             }
         }
 
@@ -1531,6 +1723,7 @@ final class ProxyService {
         log("未自动退出 Chrome；如 Chrome 仍沿用旧代理，请手动重启 Chrome", .info)
 
         await refreshStatus()
+        startupFailureCleanupCompleted = false
         phase = .idle
         statusMessage = "就绪"
         log("========== 停止完成 ==========", .success)
