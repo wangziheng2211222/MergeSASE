@@ -5,23 +5,23 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleDisplayName</key>
-    <string>MergeSASE&amp;OpenVPN</string>
+    <string>蝉舒宝</string>
     <key>CFBundleExecutable</key>
     <string>MergeSASE</string>
     <key>CFBundleIdentifier</key>
-    <string>com.mergesase.app</string>
+    <string>com.limayao.chanshubao</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>MergeSASE&amp;OpenVPN</string>
+    <string>蝉舒宝</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.6</string>
+    <string>2.0</string>
     <key>CFBundleVersion</key>
-    <string>6</string>
+    <string>7</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHumanReadableCopyright</key>

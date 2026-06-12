@@ -1,198 +1,84 @@
-# MergeSASE&OpenVPN
+# 蝉舒宝
 
-最新更新 v1.6：外网代理支持在自动 / Clash / Shadowrocket 之间选择；公司 VPN 适配支持 SASE 和 OpenVPN Connect。
+蝉舒宝是一个 macOS Codex 使用前置配置助手。它优先帮用户完成三件事：安装 CC Switch、安装 Codex 桌面版、导入公司的 CC Switch 信息。之后再引导用户连接 SASE/OpenVPN，并按需要启动 Codex 网络守护，让内网直连、外网走代理。
 
-**遇到损坏无法打开，终端执行**
-xattr -cr（把app直接拖到终端里）
-就可以打开了。
+## 功能
 
-注意想要让自己的公司内部网络生效，需要先连接 SASE 或 OpenVPN Connect，并在公司域名那边添加下自己公司的域名，xxxx.com
-
-App 会默认加入 `cds8.cn` 和 `limayao.com` 作为公司内网排除域名，你仍然可以在界面里增删自己的公司域名。
-
-> 注意：`api.company.internal` 解析到公司 VPN 内网地址，ccswitch/Codex 等应用需要直连它。MergeSASE&OpenVPN 会把这个精确 host 写进 `NO_PROXY/no_proxy`，并清理 `ALL_PROXY/all_proxy`，避免内网请求被强制兜底送入 Clash。
+- 检测 CC Switch 和 Codex 桌面版。
+- 检测 OpenVPN Connect；未安装时打开官方客户端下载页，已安装时直接打开 App 让用户连接 profile。
+- 安装 CC Switch 时打开终端自动执行安装流程，过程中可能需要输入本机密码。
+- Codex 桌面版不在后台自动安装，点击后打开 `https://chatgpt.com/zh-Hans-CN/features/desktop/`，由用户按官方页面手动安装。
+- 在 App 内置浏览器打开 `https://ai.limayao.com/developer`，用户自行授权登录。
+- 从内置浏览器当前页面读取 `.ccswitch-dropdown-item.ccswitch-dropdown-item--both` 附近内容，优先提取 `ccswitch://` 深链并唤起 CC Switch 导入。
+- 从同一页面提取 API Key，保存在本机偏好设置里，并自动查询余额。
+- 保留公司 VPN、Clash/Shadowrocket、Chrome 策略、launchd 网络守护和 `~/.codex/.env` 配置能力。
 
 ## 快速开始
 
-### 方式一：终端一键安装（推荐给普通用户）
-
-在终端执行：
+### 终端安装
 
 ```bash
 curl -fL https://raw.githubusercontent.com/wangziheng2211222/MergeSASE/main/install.sh | bash
 ```
 
-脚本会自动下载最新版本、安装到 `/Applications/MergeSASE&OpenVPN.app`、清除隔离属性并启动 App。
+脚本会下载最新发布包，安装到 `/Applications/蝉舒宝.app`，清除隔离属性并启动 App。
 
-如果要安装指定版本：
-
-```bash
-curl -fL https://raw.githubusercontent.com/wangziheng2211222/MergeSASE/main/install.sh | VERSION=v1.6 bash
-```
-
-### 方式二：从 GitHub Releases 下载安装
-
-打开仓库的 Releases 页面：
-
-https://github.com/wangziheng2211222/MergeSASE/releases
-
-下载最新版本里的 `MergeSASE-OpenVPN.zip`，解压后双击 `MergeSASE&OpenVPN.app` → 点击「一键启动」。
-
-如果 macOS 提示应用损坏或无法打开，执行：
-
-```bash
-xattr -cr "MergeSASE&OpenVPN.app"
-open "MergeSASE&OpenVPN.app"
-```
-
-- 自动检测或手动选择外网代理：Clash / Shadowrocket
-- Clash 模式会配置路由排除；Shadowrocket 模式会接管系统代理、Chrome 和应用环境，但不会写 Clash 专属配置
-- 识别 SASE / OpenVPN Connect 等公司 VPN 客户端，状态区显示当前虚拟网卡
-- 修复 Codex/ccswitch/Claude Code 等应用级代理环境：公网继续走外网代理，公司 LLM API 直连公司 VPN
-- 运行态识别 `verge-mihomo` / Clash Verge service，避免 Clash 实际运行但界面误报“未运行”
-- 实时状态监控、网络连通性检测、域名管理、日志查看
-
-### 方式三：从源码构建
+### 从源码构建
 
 ```bash
 git clone https://github.com/wangziheng2211222/MergeSASE.git
 cd MergeSASE/MergeSASE
 bash build.sh
-open "MergeSASE&OpenVPN.app"
+open "蝉舒宝.app"
 ```
 
-想放进「应用程序」目录，可以在打包完成后执行：
-
-```bash
-cp -R "MergeSASE&OpenVPN.app" /Applications/
-```
-
-### 方式四：命令行脚本
-
-```bash
-bash clash-sase-fix.command
-```
-
-> 注意：GitHub 页面右上角的「Code → Download ZIP」下载的是源码压缩包，不是已打包好的 App。普通用户想直接安装，请下载 Releases 里的 `MergeSASE-OpenVPN.zip`。
-
-### 发布安装包给用户
-
-维护者每次修复后可以用下面命令生成安装包，再上传到 GitHub Releases：
+发布安装包：
 
 ```bash
 cd MergeSASE
-bash build.sh
-COPYFILE_DISABLE=1 ditto -c -k --norsrc --keepParent "MergeSASE&OpenVPN.app" "../MergeSASE-OpenVPN.zip"
+PACKAGE=1 bash build.sh
 ```
 
-## 本次修复说明
+## 使用流程
 
-这次调整开发者余额配置方式：
+1. 打开蝉舒宝，启动页会先显示“我会稳稳地接住你 / - 蝉舒宝 -”，随后进入重点清单。
+2. 如果缺少 OpenVPN Connect，点击“下载”；如果已安装但未连接，点击“打开”后连接公司 VPN profile。
+3. 如果缺少 CC Switch，点击“安装”，在终端里完成安装；如果缺少 Codex 桌面版，点击“下载安装”并按打开的页面手动安装。
+4. 点击“导入”，在 App 内置浏览器里登录 limayao 开发者后台。
+5. 登录完成后点击“导入当前页面”。成功后会唤起 CC Switch，并把 API Key 保存到本机用于余额查询。
+6. 配置公司域名，确保默认的 `cds8.cn`、`limayao.com` 或你的公司域名在列表中。
+7. 如果需要同时使用外网代理，点击“一键配置 Codex 环境”启动网络守护，让公司内网直连 VPN、外网走 Clash/Shadowrocket。
 
-- App 不再提供独立的「配置 Key」按钮，展开「余额查询」区域后可以直接编辑一个 API Key。
-- App 不再显示刷新余额、删除 Key 等操作按钮。
-- 余额查询需要填写 limayao API Key，用户可以在 `https://ai.limayao.com/developer` 复制 Key。
-- 余额接口固定使用 `https://ai-platform-cicada-llm-api.limayao.com/api/usage/token/balance`，不暴露给用户配置。
-- 填写 Key 后，App 会自动读取并显示余额。
+## 隐私与凭据
 
-文档里的 `developer.company.internal` 和 `api.company.internal` 都是占位域名。实际使用时，请在本地应用里配置自己的公司域名，不要把真实域名、Cookie、session 值或 API Key 提交到 Git。
+- 蝉舒宝不保存网页登录态、Cookie 或 session。
+- API Key 仅保存在本机偏好设置中，用于余额查询；不会读取或保存网页登录态。
+- CC Switch provider 通过 `ccswitch://` 深链交给 CC Switch 自己导入，蝉舒宝不直接写 `~/.cc-switch/cc-switch.db`。
+- Codex 的 provider/auth 由 CC Switch 同步，蝉舒宝不直接写 Codex 认证文件。
 
-## 问题背景
+## 网络说明
 
-公司 VPN（SASE、OpenVPN Connect 等）会创建虚拟网卡接管 DNS 和路由表，Clash 或 Shadowrocket 负责外网代理。Clash 开 TUN 时还会劫持 DNS 和路由，两者同时开启会产生多层冲突：
+公司 VPN（SASE、OpenVPN Connect、GlobalProtect、Zscaler、Netskope、Cisco AnyConnect 等）和外网代理（Clash/Shadowrocket）同时运行时，容易出现 DNS、TUN、系统代理和 Chrome 策略冲突。蝉舒宝会：
 
-```
-┌─────────────────────────────────────────────┐
-│            macOS 网络栈                      │
-│  ┌──────────┐    ┌──────────┐              │
-│  │外网代理  │    │公司 VPN  │              │
-│  │(utun1024)│    │ (utun6)  │              │
-│  │ TUN 模式 │    │ VPN 隧道 │              │
-│  └────┬─────┘    └────┬─────┘              │
-│       └────────┬───────┘                     │
-│               ▼                             │
-│         路由表—两者争抢默认路由和 DNS        │
-└─────────────────────────────────────────────┘
-```
+- 为公司域名写入 Clash fake-ip/filter 和直连规则。
+- 为系统代理、Chrome 策略、launchd 环境变量写入绕过列表。
+- 在 `~/.codex/.env` 写入 HTTP(S)_PROXY 和 NO_PROXY，并清理 ALL_PROXY，避免公司内网请求被强制送入外网代理。
+- 停止时按启动前快照恢复系统代理、Chrome、Clash 和环境变量。
 
-### 冲突 1：系统代理层
-- 部分公司 VPN 会**清除系统代理设置**
-- 即使用 `networksetup` 设置代理，Chrome 也不生效
+默认公司域名包含 `cds8.cn` 和 `limayao.com`，你可以在界面里增删自己的公司域名。
 
-### 冲突 2：TUN DNS 劫持
-- Clash TUN 劫持 DNS（`any:53`），返回假 IP（`198.18.x.x`）
-- 公司内网域名被解析为假 IP → 无法访问
-- Shadowrocket 没有 Clash Verge 的 `merge.yaml`，需要在 Shadowrocket 内确认公司域名走直连
+## 排查
 
-### 冲突 3：Chrome 不走系统代理
-- Chrome 读全局代理状态，忽略系统代理绕过列表
-- QUIC/HTTP3 走 UDP，绕过 HTTP 代理
-
-## 解决方案架构
-
-四层防护，每层解决一个冲突：
-
-```
-层级 1: DNS → fake-ip-filter 排除公司域名
-  └─ *.company.internal 返回真实 IP
-
-层级 2: TUN → route-exclude 排除内网 IP（Clash 模式）
-  └─ 内网流量不经过 Clash TUN，走公司 VPN 隧道
-
-层级 3: 系统代理 → launchd 守护
-  └─ 公司 VPN 清代理 → 2 秒内自动恢复
-
-层级 4: Chrome → 命令行参数强制代理
-  └─ --proxy-server + --proxy-bypass-list（关键）
-```
-
-## 流量路径
-
-```
-访问 google.com:
-  Chrome → PROXY 127.0.0.1:端口 → Clash/Shadowrocket → 代理节点 ✅
-
-访问 api.company.internal:
-  Chrome → bypass *.company.internal → DIRECT
-    → DNS 返回真实 IP → 公司 VPN 隧道(utun/tun/tap) → 公司内网 ✅
-
-访问 baidu.com:
-  Chrome → Clash → GEOIP,CN → DIRECT → 本地网络 ✅
-```
-
-## 文件说明
-
-| 路径 | 用途 |
-|------|------|
-| `MergeSASE&OpenVPN.app` | macOS GUI 应用，一键启动/停止 |
-| `MergeSASE/Sources/` | SwiftUI 源码 |
-| `clash-sase-fix.command` | 命令行部署脚本 |
-| `Merge.yaml` | Clash Verge 合并配置模板，Shadowrocket 模式不会使用 |
-| `com.clash.proxyguard.plist` | launchd 守护配置 |
-| `解决方案.md` | 详细技术方案与踩坑记录 |
-
-## 构建
+如果 macOS 提示应用损坏或无法打开：
 
 ```bash
-cd MergeSASE
-bash build.sh
+xattr -cr "蝉舒宝.app"
+open "蝉舒宝.app"
 ```
 
-需要 macOS 13+ 及 Xcode 15+。
+如果导入失败：
 
-## 排查问题
+- 先确认已在内置浏览器登录 `https://ai.limayao.com/developer`。
+- 仍失败时，手动复制 API Key 到余额查询输入框，并在后台手动点击 CC Switch 导入按钮。
 
-详见 App 内日志面板，或命令行诊断：
-
-```bash
-# DNS 是否返回假 IP
-dig your-company-domain +short
-# 198.18.x.x = 假 IP ❌   10.x.x.x = 真实 IP ✅
-
-# 路由是否正确
-route -n get <公司内网IP>
-# interface: utun/tun/tap = 公司 VPN ✅   interface: Clash TUN = 需要检查 route-exclude ❌
-
-# 重置
-bash clash-sase-fix.command
-```
+构建需要 macOS 13+ 和 Xcode 15+。

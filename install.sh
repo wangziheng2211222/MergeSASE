@@ -1,8 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-APP_NAME="MergeSASE&OpenVPN.app"
-ZIP_NAME="MergeSASE-OpenVPN.zip"
+APP_NAME="蝉舒宝.app"
+ZIP_NAME="ChanShuBao.zip"
+LEGACY_ZIP_NAME="MergeSASE-OpenVPN.zip"
+LEGACY_APP_NAME="MergeSASE&OpenVPN.app"
 REPO="wangziheng2211222/MergeSASE"
 VERSION="${VERSION:-latest}"
 ZIP_URL="${ZIP_URL:-}"
@@ -29,29 +31,31 @@ require_command() {
 
 download_latest_release() {
     local dest="$1"
-    local url
-    local fallback_url="https://raw.githubusercontent.com/${REPO}/main/${ZIP_NAME}"
+    local urls=()
     if [ -n "$ZIP_URL" ]; then
-        url="$ZIP_URL"
+        urls+=("$ZIP_URL")
     elif [ "$VERSION" = "latest" ]; then
-        url="https://github.com/${REPO}/releases/latest/download/${ZIP_NAME}"
+        urls+=("https://github.com/${REPO}/releases/latest/download/${ZIP_NAME}")
+        urls+=("https://github.com/${REPO}/releases/latest/download/${LEGACY_ZIP_NAME}")
     else
-        url="https://github.com/${REPO}/releases/download/${VERSION}/${ZIP_NAME}"
+        urls+=("https://github.com/${REPO}/releases/download/${VERSION}/${ZIP_NAME}")
+        urls+=("https://github.com/${REPO}/releases/download/${VERSION}/${LEGACY_ZIP_NAME}")
     fi
-    log "下载安装包: ${url}"
-    if curl -fL --connect-timeout 15 --max-time 300 -o "$dest" "$url"; then
-        return
+    if [ -z "$ZIP_URL" ]; then
+        urls+=("https://raw.githubusercontent.com/${REPO}/main/${ZIP_NAME}")
+        urls+=("https://raw.githubusercontent.com/${REPO}/main/${LEGACY_ZIP_NAME}")
     fi
 
-    if [ -z "$ZIP_URL" ]; then
-        warn "GitHub Releases 下载失败，尝试备用下载源"
-        log "下载安装包: ${fallback_url}"
-        if curl -fL --connect-timeout 15 --max-time 300 -o "$dest" "$fallback_url"; then
+    local url
+    for url in "${urls[@]}"; do
+        log "下载安装包: ${url}"
+        if curl -fL --connect-timeout 15 --max-time 300 -o "$dest" "$url"; then
             return
         fi
-    fi
+        warn "下载失败，尝试下一个来源"
+    done
 
-    err "下载失败。请稍后重试，或手动下载 https://github.com/${REPO}/raw/main/${ZIP_NAME}"
+    err "下载失败。请稍后重试，或手动下载 https://github.com/${REPO}/releases"
     exit 1
 }
 
@@ -102,6 +106,9 @@ main() {
     if [ -n "$script_dir" ] && [ -f "${script_dir}/${ZIP_NAME}" ]; then
         zip_path="${script_dir}/${ZIP_NAME}"
         log "使用本地安装包: ${zip_path}"
+    elif [ -n "$script_dir" ] && [ -f "${script_dir}/${LEGACY_ZIP_NAME}" ]; then
+        zip_path="${script_dir}/${LEGACY_ZIP_NAME}"
+        log "使用本地安装包: ${zip_path}"
     else
         zip_path="${WORK_DIR}/${ZIP_NAME}"
         download_latest_release "$zip_path"
@@ -112,6 +119,9 @@ main() {
 
     local app_path
     app_path="$(find "$WORK_DIR" -maxdepth 3 -type d -name "$APP_NAME" -print -quit)"
+    if [ -z "$app_path" ]; then
+        app_path="$(find "$WORK_DIR" -maxdepth 3 -type d -name "$LEGACY_APP_NAME" -print -quit)"
+    fi
     copy_app "$app_path"
 
     if [ "$OPEN_APP" != "0" ]; then

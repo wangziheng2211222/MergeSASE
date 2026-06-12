@@ -6,9 +6,9 @@ struct MergeSASEApp: App {
     @StateObject private var svc = ProxyService()
 
     var body: some Scene {
-        WindowGroup("MergeSASE&OpenVPN", id: "main") {
+        WindowGroup("蝉舒宝", id: "main") {
             ContentView(svc: svc)
-                .navigationTitle("MergeSASE&OpenVPN")
+                .navigationTitle("蝉舒宝")
         }
         .windowResizability(.contentMinSize)
 
@@ -38,7 +38,7 @@ struct MenuBarBalanceMenu: View {
             openWindow(id: "main")
             NSApp.activate(ignoringOtherApps: true)
         } label: {
-            Text("打开主界面")
+            Text("打开蝉舒宝")
         }
 
         Button("退出") {
@@ -53,9 +53,9 @@ struct MenuBarBalanceMenu: View {
         case .stopping:
             return "停止中…"
         case .error:
-            return "重试启动守护"
+            return "重试配置 Codex 网络"
         case .idle, .running:
-            return svc.guardEffectivelyRunning ? "停止守护" : "开始守护"
+            return svc.guardEffectivelyRunning ? "停止守护" : "开启守护"
         }
     }
 

@@ -1,9 +1,36 @@
 import Foundation
 import Combine
+import AppKit
 
 enum AppPhase: String { case idle, starting, running, stopping, error }
 
 enum LogLevel { case info, success, warn, error }
+
+enum ToolInstallStatus {
+    case unknown
+    case installing
+    case installed
+    case failed
+
+    var isInstalled: Bool {
+        if case .installed = self { return true }
+        return false
+    }
+}
+
+enum CCSwitchImportStatus {
+    case notStarted
+    case waitingForLogin
+    case extracting
+    case imported
+    case needsManualPaste
+    case failed
+}
+
+enum CodexReadyStatus {
+    case incomplete
+    case ready
+}
 
 enum ExternalProxyPreference: String, CaseIterable, Identifiable {
     case auto
@@ -103,6 +130,8 @@ final class ProxyService: ObservableObject {
     @Published var vpnClientName = "未检测"
     @Published var vpnClientDetail = "请先连接 SASE 或 OpenVPN Connect"
     @Published var vpnClientRunning = false
+    @Published var openVPNConnectInstalled = false
+    @Published var openVPNConnectPath = ""
     @Published var guardLoaded = false
     @Published var chromePolicyInstalled = false
     @Published var appEnvFixed = false
@@ -121,17 +150,29 @@ final class ProxyService: ObservableObject {
     @Published var newDomain: String = ""
     @Published var apiKeys: [String] {
         didSet {
-            UserDefaults.standard.set(apiKeys, forKey: "apiKeys")
+            persistAPIKey(apiKey)
             scheduleDeveloperBalanceRefresh()
         }
     }
     @Published var developerBalanceStatus: DeveloperBalanceStatus = .unconfigured
     @Published var developerBalanceSummary: String = "未配置"
+    @Published var ccSwitchStatus: ToolInstallStatus = .unknown
+    @Published var codexStatus: ToolInstallStatus = .unknown
+    @Published var codexAppPath = ""
+    @Published var ccSwitchImportStatus: CCSwitchImportStatus = .notStarted
+    @Published var ccSwitchProviderImported = false
+    @Published var toolSetupInProgress = false
+    @Published var browserImportMessage = "等待导入"
+    @Published var ccSwitchInstallFailed = false
+    @Published var codexInstallFailed = false
     var menuBarTitle: String {
-        developerBalanceSummary
+        if developerBalanceStatus == .loading, developerBalanceSummary == "查询中" {
+            return "余额"
+        }
+        return developerBalanceSummary
     }
     var menuBarStatusText: String {
-        guardEffectivelyRunning ? "代理守护已运行" : "代理守护未启动"
+        guardEffectivelyRunning ? "Codex 网络已配置" : "Codex 网络未配置"
     }
     var menuBarSystemImage: String {
         guardEffectivelyRunning ? "shield.checkered" : "shield"
@@ -144,6 +185,43 @@ final class ProxyService: ObservableObject {
             && appEnvFixed
             && chromePolicyInstalled
     }
+    var codexReadyStatus: CodexReadyStatus {
+        ccSwitchStatus.isInstalled
+            && codexStatus.isInstalled
+            && ccSwitchProviderImported
+            && hasConfiguredAPIKey
+            && guardEffectivelyRunning ? .ready : .incomplete
+    }
+    var coreCodexSetupComplete: Bool {
+        ccSwitchStatus.isInstalled
+            && codexStatus.isInstalled
+            && ccSwitchProviderImported
+    }
+    var ccSwitchStatusText: String {
+        if ccSwitchInstallFailed { return "安装失败" }
+        if case .failed = ccSwitchStatus { return "待安装" }
+        return toolStatusText(ccSwitchStatus, installed: "已安装", missing: "待安装")
+    }
+    var codexStatusText: String {
+        if codexInstallFailed { return "安装失败" }
+        if case .failed = codexStatus { return "需要手动安装" }
+        return toolStatusText(codexStatus, installed: "已安装", missing: "待安装")
+    }
+    var vpnSetupStatusText: String {
+        if vpnClientRunning {
+            return "\(vpnClientName) 已连接"
+        }
+        if openVPNConnectInstalled {
+            return "请打开并连接 OpenVPN/SASE"
+        }
+        return "请下载并连接 OpenVPN/SASE"
+    }
+    var openVPNConnectStatusText: String {
+        if vpnClientRunning {
+            return "\(vpnClientName) 已连接"
+        }
+        return openVPNConnectInstalled ? "已安装，未连接" : "未安装"
+    }
     var hasConfiguredCompanyDomain: Bool {
         companyDomains.contains { domain in
             let normalized = normalizedHost(domain)
@@ -154,7 +232,7 @@ final class ProxyService: ObservableObject {
         apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
     var isSetupChecklistComplete: Bool {
-        hasConfiguredCompanyDomain && hasConfiguredAPIKey
+        codexReadyStatus == .ready
     }
     var shouldShowSetupChecklist: Bool {
         !isSetupChecklistComplete || !setupChecklistDismissed
@@ -163,8 +241,13 @@ final class ProxyService: ObservableObject {
         isSetupChecklistComplete
     }
     var apiKey: String { apiKeys.first ?? "" }
+    var maskedAPIKey: String {
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 8 else { return trimmed.isEmpty ? "" : "••••••••" }
+        return "\(trimmed.prefix(4))••••••\(trimmed.suffix(4))"
+    }
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-    private var backupDir: String { "\(homeDir)/Library/Application Support/MergeSASE/Backup" }
+    private var backupDir: String { "\(homeDir)/Library/Application Support/蝉舒宝/Backup" }
     private var snapshotPath: String { "\(backupDir)/snapshot.json" }
     private let managedProxyKeys = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]
     private let managedAllProxyKeys = ["ALL_PROXY", "all_proxy"]
@@ -196,10 +279,21 @@ final class ProxyService: ObservableObject {
             UserDefaults.standard.set(seededDomains, forKey: "companyDomains")
             UserDefaults.standard.set(true, forKey: defaultsSeededKey)
         }
-        self.apiKeys = UserDefaults.standard.stringArray(forKey: "apiKeys") ?? []
+        if let savedAPIKey = UserDefaults.standard.string(forKey: "developerAPIKey"),
+           !savedAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self.apiKeys = [savedAPIKey]
+        } else if let legacyAPIKey = UserDefaults.standard.stringArray(forKey: "apiKeys")?.first,
+                  !legacyAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self.apiKeys = [legacyAPIKey]
+            UserDefaults.standard.set(legacyAPIKey, forKey: "developerAPIKey")
+            UserDefaults.standard.removeObject(forKey: "apiKeys")
+        } else {
+            self.apiKeys = []
+        }
         self.setupChecklistDismissed = UserDefaults.standard.bool(forKey: "setupChecklistDismissed")
         scheduleDeveloperBalanceRefresh()
         Task {
+            await detectRequiredTools()
             await refreshStatus()
         }
     }
@@ -207,6 +301,29 @@ final class ProxyService: ObservableObject {
     private func log(_ text: String, _ level: LogLevel = .info) {
         logs.append(LogLine(timestamp: Date(), text: text, level: level))
         if logs.count > 500 { logs.removeFirst(100) }
+    }
+
+    private func toolStatusText(_ status: ToolInstallStatus, installed: String, missing: String) -> String {
+        switch status {
+        case .unknown:
+            return "检测中"
+        case .installing:
+            return "安装中"
+        case .installed:
+            return installed
+        case .failed:
+            return "失败"
+        }
+    }
+
+    private func persistAPIKey(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: "developerAPIKey")
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: "developerAPIKey")
+        }
+        UserDefaults.standard.removeObject(forKey: "apiKeys")
     }
 
     private static func deduplicatedDomains(_ domains: [String]) -> [String] {
@@ -238,6 +355,413 @@ final class ProxyService: ObservableObject {
 
     private func appleScriptStringLiteral(_ value: String) -> String {
         "\"\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\""
+    }
+
+    private func loginShellOutput(_ command: String) async -> String {
+        let result = await CommandRunner.run("/bin/zsh", ["-lc", command])
+        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func commandPath(_ command: String) async -> String? {
+        let commonPaths = [
+            "/usr/bin/\(command)"
+        ]
+        for path in commonPaths where FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        let output = await loginShellOutput("command -v \(command) 2>/dev/null || true")
+        return output.isEmpty ? nil : output
+    }
+
+    private func commandExists(_ command: String) async -> Bool {
+        await commandPath(command) != nil
+    }
+
+    private func ccSwitchAppInstalled() async -> Bool {
+        let appPaths = [
+            "/Applications/CC Switch.app",
+            "\(homeDir)/Applications/CC Switch.app"
+        ]
+        if appPaths.contains(where: { FileManager.default.fileExists(atPath: $0) }) {
+            return true
+        }
+        let spotlight = await CommandRunner.run("/usr/bin/mdfind", ["kMDItemCFBundleIdentifier == 'com.farion.ccswitch'"])
+        return spotlight.succeeded && !spotlight.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func detectCodexDesktopAppPath() async -> String? {
+        let appPaths = [
+            "/Applications/Codex.app",
+            "\(homeDir)/Applications/Codex.app",
+            "/Applications/ChatGPT.app",
+            "\(homeDir)/Applications/ChatGPT.app"
+        ]
+        if let path = appPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) {
+            return path
+        }
+
+        let spotlightQueries = [
+            "kMDItemCFBundleIdentifier == 'com.openai.codex'",
+            "kMDItemCFBundleIdentifier == 'com.openai.chat'",
+            "kMDItemDisplayName == 'Codex'",
+            "kMDItemDisplayName == 'ChatGPT'"
+        ]
+        for query in spotlightQueries {
+            let spotlight = await CommandRunner.run("/usr/bin/mdfind", [query])
+            let path = spotlight.stdout.components(separatedBy: "\n")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { $0.hasSuffix(".app") }
+            if spotlight.succeeded, let path {
+                return path
+            }
+        }
+        return nil
+    }
+
+    private func detectCompanyCCSwitchProviderImported() async -> Bool {
+        let dbPath = "\(homeDir)/.cc-switch/cc-switch.db"
+        guard FileManager.default.fileExists(atPath: dbPath) else { return false }
+
+        let domains = Self.deduplicatedDomains(Self.defaultCompanyDomains + companyDomains)
+            .filter { !$0.isEmpty }
+        guard !domains.isEmpty else { return false }
+
+        let conditions = domains.map { domain in
+            let escaped = domain.replacingOccurrences(of: "'", with: "''")
+            return """
+            coalesce(p.website_url, '') LIKE '%\(escaped)%'
+            OR coalesce(e.url, '') LIKE '%\(escaped)%'
+            OR coalesce(p.settings_config, '') LIKE '%\(escaped)%'
+            OR coalesce(p.meta, '') LIKE '%\(escaped)%'
+            """
+        }.joined(separator: " OR ")
+
+        let query = """
+        SELECT 1
+        FROM providers p
+        LEFT JOIN provider_endpoints e
+          ON p.id = e.provider_id AND p.app_type = e.app_type
+        WHERE p.app_type = 'codex' AND (\(conditions))
+        LIMIT 1;
+        """
+        let result = await CommandRunner.run("/usr/bin/sqlite3", [dbPath, query])
+        return result.succeeded && result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+    }
+
+    private func detectOpenVPNConnectAppPath() async -> String? {
+        let appPaths = [
+            "/Applications/OpenVPN Connect.app",
+            "\(homeDir)/Applications/OpenVPN Connect.app"
+        ]
+        if appPaths.contains(where: { FileManager.default.fileExists(atPath: $0) }) {
+            return appPaths.first(where: { FileManager.default.fileExists(atPath: $0) })
+        }
+        let spotlight = await CommandRunner.run("/usr/bin/mdfind", ["kMDItemCFBundleIdentifier == 'org.openvpn.client.app'"])
+        let path = spotlight.stdout.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        return spotlight.succeeded ? path : nil
+    }
+
+    func detectRequiredTools() async {
+        async let codexDesktopPath = detectCodexDesktopAppPath()
+        async let hasCodexCLI = commandExists("codex")
+        async let hasCCSwitchApp = ccSwitchAppInstalled()
+        async let hasCompanyProvider = detectCompanyCCSwitchProviderImported()
+        async let openVPNPath = detectOpenVPNConnectAppPath()
+        let (detectedCodexDesktopPath, codexCLIInstalled, ccSwitchInstalled, companyProviderImported, detectedOpenVPNPath) = await (codexDesktopPath, hasCodexCLI, hasCCSwitchApp, hasCompanyProvider, openVPNPath)
+        let codexInstalled = detectedCodexDesktopPath != nil || codexCLIInstalled
+
+        codexStatus = codexInstalled ? .installed : .failed
+        codexAppPath = detectedCodexDesktopPath ?? ""
+        ccSwitchStatus = ccSwitchInstalled ? .installed : .failed
+        ccSwitchProviderImported = companyProviderImported
+        openVPNConnectPath = detectedOpenVPNPath ?? ""
+        openVPNConnectInstalled = detectedOpenVPNPath != nil
+        if codexInstalled { codexInstallFailed = false }
+        if ccSwitchInstalled { ccSwitchInstallFailed = false }
+    }
+
+    func openOrDownloadOpenVPNConnect() {
+        if openVPNConnectInstalled {
+            let path = openVPNConnectPath.isEmpty ? "/Applications/OpenVPN Connect.app" : openVPNConnectPath
+            NSWorkspace.shared.open(URL(fileURLWithPath: path))
+            log("已打开 OpenVPN Connect，请连接公司 VPN profile", .info)
+            return
+        }
+
+        if let url = URL(string: "https://openvpn.net/client/") {
+            NSWorkspace.shared.open(url)
+            log("已打开 OpenVPN Connect 官方下载页面", .info)
+        }
+    }
+
+    func installCCSwitchIfNeeded() async {
+        await detectRequiredTools()
+        guard !ccSwitchStatus.isInstalled else {
+            log("CC Switch 已安装", .success)
+            return
+        }
+
+        toolSetupInProgress = false
+        ccSwitchStatus = .installing
+        log("将打开终端自动安装 CC Switch。过程中可能需要输入本机密码", .info)
+        let command = """
+        set -e
+        RELEASES_URL="https://github.com/farion1231/cc-switch/releases"
+        LATEST_URL=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "$RELEASES_URL/latest" || true)
+        VERSION="${LATEST_URL##*/}"
+        if [[ -z "$VERSION" || "$VERSION" == "latest" || "$VERSION" != v* ]]; then
+          echo "未能读取 CC Switch 最新版本，已打开下载页面，请手动下载 macOS DMG。"
+          open "$RELEASES_URL"
+          read -n 1 -s -r -p "按任意键关闭窗口..."
+          exit 1
+        fi
+
+        TMP_DIR=$(mktemp -d)
+        DMG_PATH="$TMP_DIR/CC-Switch-$VERSION-macOS.dmg"
+        DMG_URL="$RELEASES_URL/download/$VERSION/CC-Switch-$VERSION-macOS.dmg"
+        echo "正在下载 CC Switch $VERSION..."
+        if ! curl -fL --progress-bar -o "$DMG_PATH" "$DMG_URL"; then
+          echo "下载失败，已打开 CC Switch 下载页面，请手动下载 macOS DMG。"
+          open "$RELEASES_URL/latest"
+          read -n 1 -s -r -p "按任意键关闭窗口..."
+          exit 1
+        fi
+
+        echo "正在挂载安装包..."
+        MOUNT_POINT=$(hdiutil attach "$DMG_PATH" -nobrowse -readonly -plist | /usr/bin/python3 -c 'import plistlib,sys; data=plistlib.load(sys.stdin); print(next(item["mount-point"] for item in data["system-entities"] if "mount-point" in item))')
+        cleanup() {
+          if [[ -n "${MOUNT_POINT:-}" ]]; then
+            hdiutil detach "$MOUNT_POINT" -quiet || true
+          fi
+          rm -rf "$TMP_DIR"
+        }
+        trap cleanup EXIT
+
+        APP_PATH=$(find "$MOUNT_POINT" -maxdepth 2 -name "CC Switch.app" -type d | head -n 1)
+        if [[ -z "$APP_PATH" ]]; then
+          echo "安装包里没有找到 CC Switch.app，已打开下载页面。"
+          open "$RELEASES_URL/latest"
+          exit 1
+        fi
+
+        echo "正在复制到 /Applications..."
+        if [[ -w "/Applications" ]]; then
+          rm -rf "/Applications/CC Switch.app"
+          ditto "$APP_PATH" "/Applications/CC Switch.app"
+        else
+          sudo rm -rf "/Applications/CC Switch.app"
+          sudo ditto "$APP_PATH" "/Applications/CC Switch.app"
+        fi
+        xattr -dr com.apple.quarantine "/Applications/CC Switch.app" 2>/dev/null || true
+        open "/Applications/CC Switch.app"
+        echo
+        echo "CC Switch 安装流程结束。你可以回到蝉舒宝继续导入 provider。"
+        read -n 1 -s -r -p "按任意键关闭窗口..."
+        """
+        let script = """
+        tell application "Terminal"
+            activate
+            do script \(appleScriptStringLiteral(command))
+        end tell
+        """
+        let result = await CommandRunner.run("/usr/bin/osascript", ["-e", script])
+        if result.succeeded {
+            ccSwitchInstallFailed = false
+            browserSuggestion = "CC Switch 安装已在终端打开，完成后蝉舒宝会自动检测。"
+        } else {
+            ccSwitchInstallFailed = true
+            ccSwitchStatus = .failed
+            log("打开终端安装 CC Switch 失败: \((result.stderr.isEmpty ? result.stdout : result.stderr).prefix(240))", .error)
+            await detectRequiredTools()
+        }
+    }
+
+    func installCodexIfNeeded() async {
+        await detectRequiredTools()
+        guard !codexStatus.isInstalled else {
+            log("Codex 桌面版已安装", .success)
+            return
+        }
+        codexInstallFailed = false
+        codexStatus = .failed
+        log("Codex 桌面版需要手动安装；已打开 ChatGPT 桌面版下载页面", .info)
+        if let url = URL(string: "https://chatgpt.com/zh-Hans-CN/features/desktop/") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func openDeveloperPortal() {
+        ccSwitchImportStatus = .waitingForLogin
+        browserImportMessage = "请在登录窗口完成授权"
+        if let url = URL(string: "https://ai.limayao.com/developer") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @discardableResult
+    func saveAPIKeyLocally(_ value: String) -> Bool {
+        updateAPIKey(value)
+        return true
+    }
+
+    func importCCSwitchProviderFromBrowser() async {
+        ccSwitchImportStatus = .extracting
+        browserImportMessage = "正在读取浏览器页面"
+        log("正在从浏览器读取 limayao 开发者后台的 CC Switch 导入信息", .info)
+
+        if let payload = await extractDeveloperPayloadFromBrowser() {
+            if let apiKey = payload.apiKey {
+                saveAPIKeyLocally(apiKey)
+                log("已从开发者后台提取 API Key 并保存到本地", .success)
+            }
+            if let deepLink = payload.deepLink, let url = URL(string: deepLink) {
+                NSWorkspace.shared.open(url)
+                ccSwitchProviderImported = true
+                ccSwitchImportStatus = .imported
+                browserImportMessage = "已唤起 CC Switch 导入"
+                log("已通过 ccswitch:// 深链唤起 CC Switch 导入 provider", .success)
+                return
+            }
+            if payload.apiKey != nil {
+                ccSwitchImportStatus = .needsManualPaste
+                browserImportMessage = "已提取 Key，未找到导入深链"
+                log("已提取 API Key，但页面里未找到 ccswitch:// 导入深链，请手动点击后台的 CC Switch 导入按钮", .warn)
+                return
+            }
+        }
+
+        ccSwitchImportStatus = .needsManualPaste
+        browserImportMessage = "未读取到导入信息"
+        log("未能从浏览器读取 CC Switch 导入信息。请确认已登录后台，或手动复制 API Key", .warn)
+    }
+
+    func importCCSwitchProvider(fromPageText text: String) {
+        ccSwitchImportStatus = .extracting
+        browserImportMessage = "正在导入当前页面"
+        let payload = DeveloperPortalPayload(
+            deepLink: extractCCSwitchDeepLink(from: text),
+            apiKey: extractAPIKey(from: text)
+        )
+
+        if let apiKey = payload.apiKey {
+            saveAPIKeyLocally(apiKey)
+            log("已从内置浏览器提取 API Key 并保存到本地", .success)
+        }
+
+        if let deepLink = payload.deepLink, let url = URL(string: deepLink) {
+            NSWorkspace.shared.open(url)
+            ccSwitchProviderImported = true
+            ccSwitchImportStatus = .imported
+            browserImportMessage = "已唤起 CC Switch 导入"
+            log("已通过内置浏览器页面的 ccswitch:// 深链唤起 CC Switch 导入 provider", .success)
+            return
+        }
+
+        if payload.apiKey != nil {
+            ccSwitchImportStatus = .needsManualPaste
+            browserImportMessage = "已提取 Key，未找到导入深链"
+            log("内置浏览器已提取 API Key，但未找到 ccswitch:// 导入深链", .warn)
+        } else {
+            ccSwitchImportStatus = .needsManualPaste
+            browserImportMessage = "请先登录并打开含 CC Switch 按钮的页面"
+            log("内置浏览器当前页面未读取到 CC Switch 深链或 API Key，请确认已登录并停留在开发者后台", .warn)
+        }
+    }
+
+    func extractDeveloperAPIKeyFromBrowser() async {
+        ccSwitchImportStatus = .extracting
+        browserImportMessage = "正在提取 API Key"
+        if let payload = await extractDeveloperPayloadFromBrowser(), let apiKey = payload.apiKey {
+            saveAPIKeyLocally(apiKey)
+            ccSwitchImportStatus = .needsManualPaste
+            browserImportMessage = "已提取 API Key"
+            log("已从浏览器提取 API Key", .success)
+        } else {
+            ccSwitchImportStatus = .needsManualPaste
+            browserImportMessage = "未找到 API Key"
+            log("未能从浏览器页面提取 API Key", .warn)
+        }
+    }
+
+    private struct DeveloperPortalPayload {
+        let deepLink: String?
+        let apiKey: String?
+    }
+
+    private func extractDeveloperPayloadFromBrowser() async -> DeveloperPortalPayload? {
+        for browser in ["Google Chrome", "Safari"] {
+            let script = browserExtractionAppleScript(browserName: browser)
+            let result = await CommandRunner.run("/usr/bin/osascript", ["-e", script])
+            guard result.succeeded, !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let output = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            let deepLink = extractCCSwitchDeepLink(from: output)
+            let apiKey = extractAPIKey(from: output)
+            if deepLink != nil || apiKey != nil {
+                return DeveloperPortalPayload(deepLink: deepLink, apiKey: apiKey)
+            }
+        }
+        return nil
+    }
+
+    private func browserExtractionAppleScript(browserName: String) -> String {
+        let js = """
+        (() => {
+          const nodes = Array.from(document.querySelectorAll('.ccswitch-dropdown-item.ccswitch-dropdown-item--both, .ccswitch-dropdown-item--both, a, button'));
+          const parts = [];
+          for (const node of nodes) {
+            const attrs = Array.from(node.attributes || []).map(a => `${a.name}=${a.value}`).join(' ');
+            const text = (node.innerText || node.textContent || '').trim();
+            parts.push(`${attrs}\\n${text}`);
+          }
+          parts.push(document.body ? document.body.innerText : '');
+          return parts.join('\\n---CCS---\\n');
+        })()
+        """
+        let escapedJS = js
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+
+        if browserName == "Google Chrome" {
+            return """
+            tell application "Google Chrome"
+                if not (exists front window) then return ""
+                execute active tab of front window javascript "\(escapedJS)"
+            end tell
+            """
+        }
+
+        return """
+        tell application "Safari"
+            if not (exists front document) then return ""
+            do JavaScript "\(escapedJS)" in front document
+        end tell
+        """
+    }
+
+    private func extractCCSwitchDeepLink(from text: String) -> String? {
+        guard let match = text.firstMatch(of: /ccswitch:\/\/[^\s"'<>]+/) else { return nil }
+        return String(match.output)
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func extractAPIKey(from text: String) -> String? {
+        if let match = text.firstMatch(of: /(?i)bearer\s+([A-Za-z0-9_\-\.]{20,})/) {
+            return String(match.1)
+        }
+        if let match = text.firstMatch(of: /(?i)(?:api[_ -]?key|token|key)\s*[:=]\s*["']?([A-Za-z0-9_\-\.]{20,})/) {
+            return String(match.1).trimmingCharacters(in: CharacterSet(charactersIn: " :=\"'\n\t"))
+        }
+        if let match = text.firstMatch(of: /(sk-[A-Za-z0-9_\-]{20,})/) {
+            return String(match.1)
+        }
+        if let match = text.firstMatch(of: /(lm-[A-Za-z0-9_\-]{20,})/) {
+            return String(match.1)
+        }
+        return nil
     }
 
     private func repairLaunchAgentWithAdministratorPrivileges(plistPath: String) async -> Bool {
@@ -514,11 +1038,11 @@ final class ProxyService: ObservableObject {
 
         for line in existing.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed == "# === MergeSASE managed proxy environment ===" {
+            if trimmed == "# === MergeSASE managed proxy environment ===" || trimmed == "# === 蝉舒宝 managed proxy environment ===" {
                 skippingManagedBlock = true
                 continue
             }
-            if trimmed == "# === End MergeSASE managed proxy environment ===" {
+            if trimmed == "# === End MergeSASE managed proxy environment ===" || trimmed == "# === End 蝉舒宝 managed proxy environment ===" {
                 skippingManagedBlock = false
                 continue
             }
@@ -542,7 +1066,7 @@ final class ProxyService: ObservableObject {
 
         let block = """
 
-        # === MergeSASE managed proxy environment ===
+        # === 蝉舒宝 managed proxy environment ===
         export HTTP_PROXY=\(proxyURL)
         export HTTPS_PROXY=\(proxyURL)
         # Public traffic can still use HTTP(S)_PROXY; company VPN traffic must bypass Clash.
@@ -552,7 +1076,7 @@ final class ProxyService: ObservableObject {
         export http_proxy=\(proxyURL)
         export https_proxy=\(proxyURL)
         export no_proxy=\(noProxyValue)
-        # === End MergeSASE managed proxy environment ===
+        # === End 蝉舒宝 managed proxy environment ===
         """
 
         do {
@@ -675,7 +1199,7 @@ final class ProxyService: ObservableObject {
         }
 
         try? FileManager.default.removeItem(atPath: backupDir)
-        log("已按启动前快照恢复系统代理、Chrome、Clash 和守护配置", .success)
+        log("已按启动前快照恢复系统代理、Chrome、Clash 和网络配置", .success)
         return true
     }
 
@@ -855,8 +1379,11 @@ final class ProxyService: ObservableObject {
             return
         }
 
+        let hasVisibleBalance = developerBalanceSummary.hasPrefix("$")
         developerBalanceStatus = .loading
-        developerBalanceSummary = "查询中"
+        if !hasVisibleBalance {
+            developerBalanceSummary = "查询中"
+        }
 
         let result = await performDeveloperBalanceRequest(token: requestToken)
         guard requestToken == bearerToken(from: activeAPIKey ?? "") else { return }
@@ -957,7 +1484,7 @@ final class ProxyService: ObservableObject {
             "--max-time", "20",
             "-H", "Authorization: Bearer \(token)",
             "-H", "Accept: application/json",
-            "-H", "User-Agent: MergeSASE/1.0",
+            "-H", "User-Agent: ChanShuBao/1.0",
             "-w", "\n__MERGESASE_HTTP_CODE__:%{http_code}"
         ]
         if let proxyURL {
@@ -1273,7 +1800,7 @@ final class ProxyService: ObservableObject {
             .map { "    '+.\(normalizedHost($0))': system" }
             .joined(separator: "\n")
         let mergeContent = """
-        # MergeSASE — Clash Verge Profile Enhancement
+        # 蝉舒宝 — Clash Verge Profile Enhancement
         profile:
           store-selected: true
 
@@ -1574,10 +2101,10 @@ final class ProxyService: ObservableObject {
         do {
             try guardContent.write(toFile: guardScript, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: guardScript)
-            log("守护脚本已写入", .success)
+            log("网络配置脚本已写入", .success)
         } catch {
-            log("守护脚本写入失败: \(error.localizedDescription)", .error)
-            await failStartAndRestore("守护脚本写入失败")
+            log("网络配置脚本写入失败: \(error.localizedDescription)", .error)
+            await failStartAndRestore("网络配置脚本写入失败")
             return
         }
 
@@ -1612,7 +2139,7 @@ final class ProxyService: ObservableObject {
             log("launchd 配置已写入", .success)
         } catch {
             log("launchd 配置写入失败: \(error.localizedDescription)", .error)
-            log("已跳过自动守护；系统代理、Chrome、Clash 仍会继续配置。请检查 ~/Library/LaunchAgents 权限后重试。", .warn)
+            log("已跳过自动网络守护；系统代理、Chrome、Clash 仍会继续配置。请检查 ~/Library/LaunchAgents 权限后重试。", .warn)
         }
 
         // Set system proxy — include resolved IP ranges in bypass
@@ -1688,12 +2215,12 @@ final class ProxyService: ObservableObject {
             _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
             let loadRes = await CommandRunner.run("/bin/launchctl", ["load", plistPath])
             if loadRes.succeeded {
-                log("守护已启动（事件驱动，公司 VPN 清代理时 2 秒内恢复）", .success)
+                log("网络守护已启动（事件驱动，公司 VPN 清代理时 2 秒内恢复）", .success)
                 guardLoaded = true
             } else {
-                log("守护启动失败: \(loadRes.stderr.isEmpty ? "launchctl 未返回详细原因" : loadRes.stderr)", .warn)
+                log("网络守护启动失败: \(loadRes.stderr.isEmpty ? "launchctl 未返回详细原因" : loadRes.stderr)", .warn)
                 guardLoaded = false
-                await failStartAndRestore("守护启动失败")
+                await failStartAndRestore("网络守护启动失败")
                 return
             }
         }
@@ -1705,7 +2232,7 @@ final class ProxyService: ObservableObject {
             statusMessage = "运行中"
             log("========== 启动完成 ==========", .success)
         } else {
-            await failStartAndRestore(systemProxyEnabled ? "守护未加载" : "系统代理未生效")
+            await failStartAndRestore(systemProxyEnabled ? "网络守护未加载" : "系统代理未生效")
             return
         }
 
@@ -1728,7 +2255,7 @@ final class ProxyService: ObservableObject {
         // 1. Unload launchd guard
         _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
         guardLoaded = false
-        log("守护已停止", .success)
+        log("网络守护已停止", .success)
 
         if startupFailureCleanupCompleted {
             log("启动失败时已自动还原/清理，本次跳过重复清理", .info)
