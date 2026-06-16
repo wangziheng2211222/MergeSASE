@@ -36,13 +36,13 @@ download_latest_release() {
         urls+=("$ZIP_URL")
     elif [ "$VERSION" = "latest" ]; then
         urls+=("https://github.com/${REPO}/releases/latest/download/${ZIP_NAME}")
+        urls+=("https://raw.githubusercontent.com/${REPO}/main/${ZIP_NAME}")
         urls+=("https://github.com/${REPO}/releases/latest/download/${LEGACY_ZIP_NAME}")
     else
         urls+=("https://github.com/${REPO}/releases/download/${VERSION}/${ZIP_NAME}")
         urls+=("https://github.com/${REPO}/releases/download/${VERSION}/${LEGACY_ZIP_NAME}")
     fi
     if [ -z "$ZIP_URL" ]; then
-        urls+=("https://raw.githubusercontent.com/${REPO}/main/${ZIP_NAME}")
         urls+=("https://raw.githubusercontent.com/${REPO}/main/${LEGACY_ZIP_NAME}")
     fi
 

@@ -18,7 +18,7 @@
 ### 终端安装
 
 ```bash
-curl -fL https://raw.githubusercontent.com/wangziheng2211222/MergeSASE/main/install.sh | bash
+curl -fL https://raw.githubusercontent.com/wangziheng2211222/MergeSASE/main/install.sh | VERSION=1.7 bash
 ```
 
 脚本会下载最新发布包，安装到 `/Applications/蝉舒宝.app`，清除隔离属性并启动 App。
