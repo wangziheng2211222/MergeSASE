@@ -55,7 +55,7 @@ struct MenuBarBalanceMenu: View {
         case .error:
             return "重试配置 Codex 网络"
         case .idle, .running:
-            return svc.guardEffectivelyRunning ? "停止守护" : "开启守护"
+            return svc.guardNeedsStopping ? "停止守护" : "开启守护"
         }
     }
 
@@ -66,7 +66,7 @@ struct MenuBarBalanceMenu: View {
         case .error:
             return "arrow.clockwise"
         case .idle, .running:
-            return svc.guardEffectivelyRunning ? "stop.fill" : "play.fill"
+            return svc.guardNeedsStopping ? "stop.fill" : "play.fill"
         }
     }
 
@@ -78,7 +78,7 @@ struct MenuBarBalanceMenu: View {
     private func toggleGuard() async {
         if svc.phase == .error {
             await svc.retry()
-        } else if svc.guardEffectivelyRunning {
+        } else if svc.guardNeedsStopping {
             await svc.stop()
         } else {
             await svc.start()

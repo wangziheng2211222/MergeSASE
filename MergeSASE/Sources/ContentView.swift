@@ -90,6 +90,9 @@ struct ContentView: View {
         .onChange(of: svc.externalProxyPreference) { _ in
             Task { await svc.refreshStatus() }
         }
+        .onChange(of: svc.shadowrocketPortText) { _ in
+            Task { await svc.refreshStatus() }
+        }
         .onChange(of: svc.hasConfiguredCompanyDomain) { configured in
             if configured {
                 setupChecklistHiddenForSession = false
@@ -165,6 +168,8 @@ struct ContentView: View {
             Image(nsImage: NSImage(named: "Title.svg") ?? NSImage(named: "Title.png") ?? NSImage())
                 .resizable()
                 .interpolation(.high)
+                .renderingMode(.template)
+                .foregroundColor(.primary)
                 .aspectRatio(contentMode: .fit)
                 .frame(width: 176, height: 252)
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -212,7 +217,7 @@ struct ContentView: View {
                     secondaryBtn("重试", icon: "arrow.clockwise") { Task { await svc.retry() } }
                 }
             case .idle, .running:
-                if svc.guardEffectivelyRunning {
+                if svc.guardNeedsStopping {
                     actionBtn("停止守护", icon: "stop.fill", tint: Color(.systemGray)) { Task { await svc.stop() } }
                 } else {
                     actionBtn(
@@ -250,7 +255,7 @@ struct ContentView: View {
     }
 
     private var footerContact: some View {
-        Text("有问题联系 钉钉 @子恒 微信：steve_sunrui")
+        Text("有问题联系 钉钉 @子恒 微信：steve_sunrui · \(svc.appVersionText)")
             .font(.system(size: 10))
             .foregroundColor(.secondary.opacity(0.45))
             .textSelection(.enabled)
@@ -288,12 +293,23 @@ struct ContentView: View {
             StatRow(icon: "lock.shield", label: "公司 VPN", detail: svc.vpnClientRunning ? "\(svc.vpnClientName) · \(svc.vpnClientDetail)" : svc.vpnClientDetail, active: svc.vpnClientRunning)
             sep
             ExternalProxyRow(
-                detail: svc.externalProxyRunning ? "\(svc.externalProxyName) · \(svc.externalProxyDetail)" : "\(svc.externalProxyPreference.label) · 未运行",
+                detail: "\(svc.externalProxyName) · \(svc.externalProxyDetail)",
                 active: svc.externalProxyRunning,
-                selection: $svc.externalProxyPreference
+                selection: $svc.externalProxyPreference,
+                shadowrocketPort: $svc.shadowrocketPortText,
+                configurationLocked: networkSettingsLocked
             )
             sep
-            StatRow(icon: "arrow.left.arrow.right", label: "系统代理", detail: svc.systemProxyEnabled ? "\(svc.proxyHost):\(svc.clashPort)" : "未启用", active: svc.systemProxyEnabled)
+            StatRow(
+                icon: "arrow.left.arrow.right",
+                label: "系统代理",
+                detail: svc.systemProxyEnabled
+                    ? (svc.systemProxyMatchesExternal
+                        ? (svc.systemProxyBypassValid ? "\(svc.proxyHost):\(svc.clashPort)" : "公司绕过列表不完整")
+                        : "端口与所选代理不一致")
+                    : "未启用",
+                active: svc.systemProxyEnabled && svc.systemProxyMatchesExternal && svc.systemProxyBypassValid
+            )
             sep
             StatRow(icon: "shield.checkered", label: "网络守护", detail: svc.guardLoaded ? "已加载" : "未加载", active: svc.guardLoaded)
             sep
@@ -532,6 +548,7 @@ struct ContentView: View {
             .contentShape(Rectangle())
             .padding(.vertical, 8)
             .onTapGesture {
+                guard !networkSettingsLocked else { return }
                 let opening = !showDomainEditor
                 withAnimation(.easeInOut(duration: 0.15)) { showDomainEditor.toggle() }
                 if opening {
@@ -583,12 +600,14 @@ struct ContentView: View {
                     }
                 }
                 .padding(.top, 4)
+                .disabled(networkSettingsLocked)
             }
         }
         .card()
         .contentShape(RoundedRectangle(cornerRadius: 10))
+        .help(networkSettingsLocked ? "请先停止守护，再修改公司域名" : "")
         .onTapGesture {
-            guard !showDomainEditor else { return }
+            guard !networkSettingsLocked, !showDomainEditor else { return }
             withAnimation(.easeInOut(duration: 0.15)) { showDomainEditor = true }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 domainFieldFocused = true
@@ -675,15 +694,17 @@ struct ContentView: View {
     }
     private var developerBalanceColor: Color {
         switch svc.developerBalanceStatus {
-        case .ok:
+        case .ok, .loading:
             Color(red: 0.92, green: 0.64, blue: 0.08)
         case .error, .unauthorized:
             .red
-        case .loading:
-            .blue
         case .unconfigured:
             .secondary
         }
+    }
+
+    private var networkSettingsLocked: Bool {
+        svc.guardNeedsStopping || svc.phase == .starting || svc.phase == .stopping
     }
     private func logColor(_ level: LogLevel) -> Color {
         switch level { case .success: .green; case .warn: .orange; case .error: .red; case .info: .primary }
@@ -719,6 +740,8 @@ struct ExternalProxyRow: View {
     let detail: String
     let active: Bool
     @Binding var selection: ExternalProxyPreference
+    @Binding var shadowrocketPort: String
+    let configurationLocked: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -742,6 +765,7 @@ struct ExternalProxyRow: View {
                     .controlSize(.small)
                     .labelsHidden()
                     .frame(width: 168)
+                    .disabled(configurationLocked)
                 }
 
                 HStack(spacing: 3) {
@@ -751,6 +775,20 @@ struct ExternalProxyRow: View {
                         .foregroundColor(active ? .secondary : .secondary.opacity(0.35))
                         .lineLimit(1)
                         .truncationMode(.middle)
+                }
+
+                if selection == .shadowrocket {
+                    HStack(spacing: 8) {
+                        Text("Proxy Port")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary.opacity(0.65))
+                        TextField("例如 1087", text: $shadowrocketPort)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11, design: .monospaced))
+                            .frame(width: 86)
+                            .disabled(configurationLocked)
+                        Spacer(minLength: 0)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -909,7 +947,7 @@ extension View {
 }
 
 private let timeF: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
-private let appBg = Color(red: 0.94, green: 0.94, blue: 0.95)
-private let cardBg = Color(red: 0.985, green: 0.985, blue: 0.99)
-private let fieldBg = Color(red: 0.955, green: 0.955, blue: 0.965)
+private let appBg = Color(nsColor: .windowBackgroundColor)
+private let cardBg = Color(nsColor: .controlBackgroundColor)
+private let fieldBg = Color.primary.opacity(0.055)
 private let separatorColor = Color(nsColor: .separatorColor).opacity(0.55)

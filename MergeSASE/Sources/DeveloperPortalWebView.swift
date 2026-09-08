@@ -5,7 +5,11 @@ import AppKit
 struct DeveloperPortalWebView: View {
     @ObservedObject var svc: ProxyService
     @Environment(\.dismiss) private var dismiss
-    @State private var webView = WKWebView()
+    @State private var webView: WKWebView = {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        return WKWebView(frame: .zero, configuration: configuration)
+    }()
     @State private var currentURL = "https://ai.limayao.com/developer"
     @State private var loading = false
     @State private var importInProgress = false

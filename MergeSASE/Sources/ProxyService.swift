@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import AppKit
+import Darwin
 
 enum AppPhase: String { case idle, starting, running, stopping, error }
 
@@ -99,10 +100,19 @@ struct FileSnapshot: Codable {
 }
 
 struct RestoreSnapshot: Codable {
+    var formatVersion: Int?
     var createdAt: Date
     var networkServices: [NetworkServiceSnapshot]
     var files: [FileSnapshot]
     var launchdEnvironment: [String: String?]?
+    var managedRuntime: ManagedRuntimeSnapshot?
+}
+
+struct ManagedRuntimeSnapshot: Codable {
+    var networkServices: [String]
+    var bypassDomains: [String]
+    var proxyHost: String
+    var proxyPort: Int
 }
 
 enum DeveloperBalanceStatus {
@@ -119,9 +129,14 @@ final class ProxyService: ObservableObject {
     @Published var clashRunning = false
     @Published var clashPort: Int = 7897
     @Published var systemProxyEnabled = false
+    @Published var systemProxyMatchesExternal = false
+    @Published var systemProxyBypassValid = false
     @Published var proxyHost: String = "127.0.0.1"
     @Published var externalProxyPreference: ExternalProxyPreference {
         didSet { UserDefaults.standard.set(externalProxyPreference.rawValue, forKey: "externalProxyPreference") }
+    }
+    @Published var shadowrocketPortText: String = "" {
+        didSet { UserDefaults.standard.set(shadowrocketPortText, forKey: "shadowrocketProxyPort") }
     }
     @Published var externalProxyName = "未检测"
     @Published var externalProxyDetail = "请选择 Clash 或 Shadowrocket"
@@ -181,9 +196,18 @@ final class ProxyService: ObservableObject {
         vpnClientRunning
             && externalProxyRunning
             && systemProxyEnabled
+            && systemProxyMatchesExternal
+            && systemProxyBypassValid
             && guardLoaded
             && appEnvFixed
             && chromePolicyInstalled
+    }
+    var guardNeedsStopping: Bool {
+        let paths = managedPaths()
+        return guardLoaded
+            || FileManager.default.fileExists(atPath: snapshotPath)
+            || FileManager.default.fileExists(atPath: paths.plist)
+            || FileManager.default.fileExists(atPath: paths.guardScript)
     }
     var codexReadyStatus: CodexReadyStatus {
         ccSwitchStatus.isInstalled
@@ -224,9 +248,14 @@ final class ProxyService: ObservableObject {
     }
     var hasConfiguredCompanyDomain: Bool {
         companyDomains.contains { domain in
-            let normalized = normalizedHost(domain)
-            return !normalized.isEmpty && normalized != "company.internal"
+            guard let normalized = NetworkCompatibility.normalizedDomain(domain) else { return false }
+            return normalized != "company.internal"
         }
+    }
+    var appVersionText: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+        return build.isEmpty ? "v\(version)" : "v\(version) (\(build))"
     }
     var hasConfiguredAPIKey: Bool {
         apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
@@ -249,10 +278,13 @@ final class ProxyService: ObservableObject {
     private let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
     private var backupDir: String { "\(homeDir)/Library/Application Support/蝉舒宝/Backup" }
     private var snapshotPath: String { "\(backupDir)/snapshot.json" }
+    private let guardLaunchdLabel = "com.clash.proxyguard"
+    private var guardLaunchdService: String { "gui/\(getuid())/\(guardLaunchdLabel)" }
     private let managedProxyKeys = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]
     private let managedAllProxyKeys = ["ALL_PROXY", "all_proxy"]
     private let managedNoProxyKeys = ["NO_PROXY", "no_proxy"]
     private var managedEnvKeys: [String] { managedProxyKeys + managedAllProxyKeys + managedNoProxyKeys }
+    private let currentSnapshotFormatVersion = 2
     private static let defaultCompanyDomains = ["cds8.cn", "limayao.com"]
     private let proxyRequiredHosts: [String] = []
     private var directCompanyHosts: [String] {
@@ -264,6 +296,11 @@ final class ProxyService: ObservableObject {
     private var developerBalanceRefreshTask: Task<Void, Never>?
     private var developerBalanceAutoRefreshTask: Task<Void, Never>?
     private var startupFailureCleanupCompleted = false
+    private var stopInProgress = false
+    private var monitoredNetworkServices: [String] = []
+    private var monitoredBypassDomains: [String] = []
+    private var monitoredProxyEndpoint: LocalProxyEndpoint?
+    private var refreshGeneration: UInt64 = 0
 
     init() {
         let savedProxyPreference = UserDefaults.standard.string(forKey: "externalProxyPreference") ?? ExternalProxyPreference.auto.rawValue
@@ -291,6 +328,7 @@ final class ProxyService: ObservableObject {
             self.apiKeys = []
         }
         self.setupChecklistDismissed = UserDefaults.standard.bool(forKey: "setupChecklistDismissed")
+        self.shadowrocketPortText = UserDefaults.standard.string(forKey: "shadowrocketProxyPort") ?? ""
         scheduleDeveloperBalanceRefresh()
         Task {
             await detectRequiredTools()
@@ -301,6 +339,10 @@ final class ProxyService: ObservableObject {
     private func log(_ text: String, _ level: LogLevel = .info) {
         logs.append(LogLine(timestamp: Date(), text: text, level: level))
         if logs.count > 500 { logs.removeFirst(100) }
+    }
+
+    private func invalidateStatusRefreshes() {
+        refreshGeneration &+= 1
     }
 
     private func toolStatusText(_ status: ToolInstallStatus, installed: String, missing: String) -> String {
@@ -329,12 +371,9 @@ final class ProxyService: ObservableObject {
     private static func deduplicatedDomains(_ domains: [String]) -> [String] {
         var seen = Set<String>()
         return domains.compactMap { value in
-            let domain = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-                .replacingOccurrences(of: "*.", with: "")
-                .replacingOccurrences(of: "+.", with: "")
-                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-            guard !domain.isEmpty, seen.insert(domain).inserted else { return nil }
+            guard let domain = NetworkCompatibility.normalizedDomain(value), seen.insert(domain).inserted else {
+                return nil
+            }
             return domain
         }
     }
@@ -847,6 +886,8 @@ final class ProxyService: ObservableObject {
             "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/merge.yaml",
             "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/merge.yaml",
             "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/dns_config.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge-check.yaml",
         ]
         let chromePaths = [
             "\(homeDir)/Library/Preferences/com.google.Chrome.plist",
@@ -855,20 +896,78 @@ final class ProxyService: ObservableObject {
         return (plistPath, guardScript, mergePaths + [codexEnvPath], chromePaths)
     }
 
-    private func parseProxyEndpoint(_ output: String) -> ProxyEndpointSnapshot {
-        var enabled = false
-        var server = ""
-        var port = ""
+    private func isLaunchdGuardLoaded() async -> Bool {
+        let result = await CommandRunner.run("/bin/launchctl", ["print", guardLaunchdService])
+        return result.succeeded
+    }
+
+    private func isGuardScriptRunning(_ guardScript: String) async -> Bool {
+        let escapedPath = NSRegularExpression.escapedPattern(for: guardScript)
+        let result = await CommandRunner.run("/usr/bin/pgrep", ["-f", escapedPath])
+        return result.succeeded && !result.stdout.isEmpty
+    }
+
+    private func stopLaunchdGuard(plistPath: String, guardScript: String) async -> Bool {
+        let launchdDomain = "gui/\(getuid())"
+
+        _ = await CommandRunner.run("/bin/launchctl", ["bootout", guardLaunchdService])
+        if await isLaunchdGuardLoaded() {
+            _ = await CommandRunner.run("/bin/launchctl", ["bootout", launchdDomain, plistPath])
+        }
+        if await isLaunchdGuardLoaded() {
+            _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
+        }
+        if await isLaunchdGuardLoaded() {
+            _ = await CommandRunner.run("/bin/launchctl", ["remove", guardLaunchdLabel])
+        }
+
+        let escapedPath = NSRegularExpression.escapedPattern(for: guardScript)
+        _ = await CommandRunner.run("/usr/bin/pkill", ["-TERM", "-f", escapedPath])
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        let launchdLoaded = await isLaunchdGuardLoaded()
+        let scriptRunning = await isGuardScriptRunning(guardScript)
+        guardLoaded = launchdLoaded
+        if launchdLoaded || scriptRunning {
+            var details: [String] = []
+            if launchdLoaded { details.append("launchd 任务仍已加载") }
+            if scriptRunning { details.append("守护脚本进程仍在运行") }
+            log("网络守护停止失败: \(details.joined(separator: "；"))", .error)
+            return false
+        }
+
+        log("网络守护已从 launchd 完全移除", .success)
+        return true
+    }
+
+    private func parseCompleteProxyEndpoint(_ output: String) -> ProxyEndpointSnapshot? {
+        var enabled: Bool?
+        var server: String?
+        var port: String?
         for line in output.components(separatedBy: "\n") {
             let parts = line.components(separatedBy: ":")
             guard parts.count >= 2 else { continue }
             let key = parts[0].trimmingCharacters(in: .whitespaces)
             let value = parts.dropFirst().joined(separator: ":").trimmingCharacters(in: .whitespaces)
-            if key == "Enabled" { enabled = value.lowercased().hasPrefix("yes") }
+            if key == "Enabled" {
+                if value.lowercased().hasPrefix("yes") { enabled = true }
+                else if value.lowercased().hasPrefix("no") { enabled = false }
+            }
             if key == "Server" { server = value }
             if key == "Port" { port = value }
         }
+        guard let enabled, let server, let port else { return nil }
+        if enabled {
+            guard !server.isEmpty, let portNumber = Int(port), (1...65535).contains(portNumber) else {
+                return nil
+            }
+        }
         return ProxyEndpointSnapshot(enabled: enabled, server: server, port: port)
+    }
+
+    private func parseProxyEndpoint(_ output: String) -> ProxyEndpointSnapshot {
+        parseCompleteProxyEndpoint(output)
+            ?? ProxyEndpointSnapshot(enabled: false, server: "", port: "")
     }
 
     private func parseBypassDomains(_ output: String) -> [String] {
@@ -878,11 +977,7 @@ final class ProxyService: ObservableObject {
     }
 
     private func normalizedHost(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "*.", with: "")
-            .replacingOccurrences(of: "+.", with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        NetworkCompatibility.normalizedDomain(value) ?? ""
     }
 
     private func isClashFakeIP(_ ip: String) -> Bool {
@@ -893,16 +988,13 @@ final class ProxyService: ObservableObject {
         output.components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { ip in
-                let parts = ip.split(separator: ".")
-                return parts.count == 4
-                    && parts.allSatisfy { Int($0) != nil }
-                    && !isClashFakeIP(ip)
+                NetworkCompatibility.isValidIPv4(ip) && !isClashFakeIP(ip)
             }
     }
 
     private func routeRange(for ip: String) -> String? {
         let parts = ip.components(separatedBy: ".")
-        guard parts.count == 4, parts.allSatisfy({ Int($0) != nil }) else { return nil }
+        guard NetworkCompatibility.isValidIPv4(ip) else { return nil }
         return "\(parts[0]).\(parts[1]).0.0/16"
     }
 
@@ -915,7 +1007,8 @@ final class ProxyService: ObservableObject {
     }
 
     private func resolveRealIPv4(_ host: String, nameservers: [String]? = nil) async -> String? {
-        let direct = await CommandRunner.runShell("dig +short \(host) 2>/dev/null")
+        guard let host = NetworkCompatibility.normalizedDomain(host) else { return nil }
+        let direct = await CommandRunner.run("/usr/bin/dig", ["+short", host])
         if let ip = realIPv4(from: direct.stdout) {
             return ip
         }
@@ -927,7 +1020,8 @@ final class ProxyService: ObservableObject {
             servers = await systemNameservers()
         }
         for server in servers {
-            let result = await CommandRunner.runShell("dig @\(server) +short \(host) 2>/dev/null")
+            guard NetworkCompatibility.isValidIPv4(server) else { continue }
+            let result = await CommandRunner.run("/usr/bin/dig", ["@\(server)", "+short", host])
             if let ip = realIPv4(from: result.stdout) {
                 return ip
             }
@@ -953,6 +1047,27 @@ final class ProxyService: ObservableObject {
             return directCompanyHosts.filter { host($0, isUnder: domain) }
         }
         return [domain, "*.\(domain)"]
+    }
+
+    private var requiredCompanyBypassItems: [String] {
+        companyDomains.flatMap { broadBypassItems(for: $0) }
+    }
+
+    private var baselineBypassItems: [String] {
+        ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
+         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"]
+            + requiredCompanyBypassItems
+    }
+
+    private func managedBypassItems(nameservers: [String]) async -> [String] {
+        var items = baselineBypassItems
+        for domain in companyDomains {
+            if let ip = await resolveRealIPv4(domain, nameservers: nameservers), let range = routeRange(for: ip) {
+                items.append(range)
+            }
+        }
+        var seen = Set<String>()
+        return items.filter { seen.insert($0).inserted }
     }
 
     private func bypassItemCoversProxyRequiredHost(_ item: String) -> Bool {
@@ -1004,31 +1119,41 @@ final class ProxyService: ObservableObject {
         return items.filter { seen.insert($0).inserted }
     }
 
-    private func setLaunchdNoProxy(_ bypassItems: [String]) async {
+    private func setLaunchdNoProxy(_ bypassItems: [String]) async -> Bool {
         let value = noProxyItems(from: bypassItems).joined(separator: ",")
         for key in managedNoProxyKeys {
-            _ = await CommandRunner.run("/bin/launchctl", ["setenv", key, value])
+            let result = await CommandRunner.run("/bin/launchctl", ["setenv", key, value])
+            guard result.succeeded else { return false }
+            let actual = await CommandRunner.run("/bin/launchctl", ["getenv", key])
+            guard actual.succeeded, actual.stdout == value else { return false }
         }
         log("已设置应用环境 NO_PROXY/no_proxy（ccswitch 等非浏览器应用需重启后生效）", .success)
+        return true
     }
 
-    private func setLaunchdProxy(port: Int) async {
-        let host = proxyHost.isEmpty ? "127.0.0.1" : proxyHost
-        let proxyURL = "http://\(host):\(port)"
+    private func setLaunchdProxy(endpoint: LocalProxyEndpoint) async -> Bool {
+        let proxyURL = proxyURL(for: endpoint)
         for key in managedProxyKeys {
-            _ = await CommandRunner.run("/bin/launchctl", ["setenv", key, proxyURL])
+            let result = await CommandRunner.run("/bin/launchctl", ["setenv", key, proxyURL])
+            guard result.succeeded else { return false }
+            let actual = await CommandRunner.run("/bin/launchctl", ["getenv", key])
+            guard actual.succeeded, actual.stdout == proxyURL else { return false }
         }
         for key in managedAllProxyKeys {
-            _ = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
+            let result = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
+            guard result.succeeded else { return false }
+            let actual = await CommandRunner.run("/bin/launchctl", ["getenv", key])
+            guard actual.stdout.isEmpty else { return false }
         }
         log("已设置应用环境 HTTP_PROXY/HTTPS_PROXY（ccswitch 等非浏览器应用需重启后生效）", .success)
         log("已清理应用环境 ALL_PROXY/all_proxy，避免强制兜底走 Clash", .success)
+        return true
     }
 
-    private func writeAppEnvironment(port: Int, bypassItems: [String]) async {
+    private func writeAppEnvironment(endpoint: LocalProxyEndpoint, bypassItems: [String]) async {
         let codexDir = "\(homeDir)/.codex"
         let codexEnvPath = "\(codexDir)/.env"
-        let proxyURL = "http://127.0.0.1:\(port)"
+        let proxyURL = proxyURL(for: endpoint)
         let noProxyValue = noProxyItems(from: bypassItems).joined(separator: ",")
 
         try? FileManager.default.createDirectory(atPath: codexDir, withIntermediateDirectories: true)
@@ -1080,39 +1205,180 @@ final class ProxyService: ObservableObject {
         """
 
         do {
-            try (kept.joined(separator: "\n") + block + "\n").write(toFile: codexEnvPath, atomically: true, encoding: .utf8)
-            appEnvFixed = true
-            log("Codex/应用代理环境已修复: 公司域名与公司 VPN 网段直连，公网仍走 Clash", .success)
+            let content = kept.joined(separator: "\n") + block + "\n"
+            try content.write(toFile: codexEnvPath, atomically: true, encoding: .utf8)
+            appEnvFixed = (try? String(contentsOfFile: codexEnvPath, encoding: .utf8)) == content
+            if appEnvFixed {
+                log("Codex/应用代理环境已写入并校验", .success)
+            } else {
+                log("Codex/应用代理环境写入后读回校验失败", .error)
+            }
         } catch {
             appEnvFixed = false
             log("Codex/应用代理环境写入失败: \(error.localizedDescription)", .warn)
         }
     }
 
-    private func restoreLaunchdEnvironment(_ snapshot: RestoreSnapshot) async {
+    private func restoreLaunchdEnvironment(_ snapshot: RestoreSnapshot) async -> [String] {
+        var issues: [String] = []
         let launchdEnvironment = snapshot.launchdEnvironment ?? [:]
         for key in managedEnvKeys {
+            let result: CommandResult
             if let stored = launchdEnvironment[key], let value = stored, !value.isEmpty {
-                _ = await CommandRunner.run("/bin/launchctl", ["setenv", key, value])
+                result = await CommandRunner.run("/bin/launchctl", ["setenv", key, value])
             } else {
-                _ = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
+                result = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
             }
+            if !result.succeeded { issues.append("环境变量 \(key) 写入") }
+        }
+        return issues
+    }
+
+    private func snapshotIsUsable(at path: String) -> Bool {
+        guard
+            let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+            let snapshot = try? JSONDecoder().decode(RestoreSnapshot.self, from: data)
+        else {
+            return false
+        }
+
+        guard snapshot.formatVersion == currentSnapshotFormatVersion,
+              let launchdEnvironment = snapshot.launchdEnvironment,
+              let runtime = snapshot.managedRuntime,
+              Set(launchdEnvironment.keys) == Set(managedEnvKeys),
+              !snapshot.networkServices.isEmpty,
+              !runtime.networkServices.isEmpty,
+              runtime.networkServices == snapshot.networkServices.map(\.service),
+              !runtime.bypassDomains.isEmpty,
+              !runtime.proxyHost.isEmpty,
+              (1...65535).contains(runtime.proxyPort)
+        else {
+            return false
+        }
+
+        let serviceNames = snapshot.networkServices.map(\.service)
+        guard serviceNames.allSatisfy({ !$0.isEmpty }), Set(serviceNames).count == serviceNames.count else {
+            return false
+        }
+
+        let paths = managedPaths()
+        let expectedPaths = Set(paths.chromePaths + paths.mergePaths)
+        let savedPaths = snapshot.files.map(\.path)
+        guard snapshot.files.count == expectedPaths.count,
+              Set(savedPaths) == expectedPaths,
+              Set(savedPaths).count == savedPaths.count
+        else {
+            return false
+        }
+
+        var backupNames = Set<String>()
+        return snapshot.files.allSatisfy { file in
+            guard file.existed else { return file.backupName == nil }
+            guard let backupName = file.backupName,
+                  !backupName.isEmpty,
+                  backupName == (backupName as NSString).lastPathComponent,
+                  backupNames.insert(backupName).inserted
+            else {
+                return false
+            }
+            return FileManager.default.fileExists(atPath: "\(backupDir)/\(backupName)")
         }
     }
 
-    private func takeRestoreSnapshotIfNeeded() async {
+    private func legacySnapshotIsRestorable(_ snapshot: RestoreSnapshot) -> Bool {
+        guard snapshot.formatVersion == nil,
+              let launchdEnvironment = snapshot.launchdEnvironment,
+              Set(launchdEnvironment.keys).isSubset(of: Set(managedEnvKeys)),
+              !snapshot.networkServices.isEmpty
+        else {
+            return false
+        }
+
+        let serviceNames = snapshot.networkServices.map(\.service)
+        guard serviceNames.allSatisfy({ !$0.isEmpty }), Set(serviceNames).count == serviceNames.count else {
+            return false
+        }
+
+        let paths = managedPaths()
+        let legacyPaths = Set(paths.chromePaths + paths.mergePaths.filter {
+            let name = ($0 as NSString).lastPathComponent
+            return name != "clash-verge.yaml" && name != "clash-verge-check.yaml"
+        })
+        let savedPaths = snapshot.files.map(\.path)
+        let savedPathSet = Set(savedPaths)
+        let legacyPathsWithGuardFiles = legacyPaths.union([paths.plist, paths.guardScript])
+        guard (savedPathSet == legacyPaths || savedPathSet == legacyPathsWithGuardFiles),
+              Set(savedPaths).count == savedPaths.count
+        else {
+            return false
+        }
+
+        var backupNames = Set<String>()
+        return snapshot.files.allSatisfy { file in
+            guard file.existed else { return file.backupName == nil }
+            guard let backupName = file.backupName,
+                  !backupName.isEmpty,
+                  backupName == (backupName as NSString).lastPathComponent,
+                  backupNames.insert(backupName).inserted
+            else {
+                return false
+            }
+            return FileManager.default.fileExists(atPath: "\(backupDir)/\(backupName)")
+        }
+    }
+
+    private func activePhysicalNetworkServices() async -> [String] {
+        let order = await CommandRunner.run("/usr/sbin/networksetup", ["-listnetworkserviceorder"])
+        guard order.succeeded else { return [] }
+
+        var result: [String] = []
+        for service in NetworkCompatibility.physicalNetworkServices(from: order.stdout) {
+            let interface = await CommandRunner.run("/sbin/ifconfig", [service.device])
+            guard interface.succeeded else { continue }
+            let hasIPv4 = interface.stdout.components(separatedBy: .newlines).contains {
+                $0.trimmingCharacters(in: .whitespaces).hasPrefix("inet ")
+            }
+            if interface.stdout.contains("status: active") || hasIPv4 {
+                result.append(service.name)
+            }
+        }
+        return result
+    }
+
+    private func takeRestoreSnapshotIfNeeded(
+        for services: [String],
+        managedRuntime: ManagedRuntimeSnapshot
+    ) async -> Bool {
+        let paths = managedPaths()
+        let liveGuardLoaded = await isLaunchdGuardLoaded()
+        let guardScriptRunning = await isGuardScriptRunning(paths.guardScript)
+        if FileManager.default.fileExists(atPath: paths.plist)
+            || FileManager.default.fileExists(atPath: paths.guardScript)
+            || liveGuardLoaded
+            || guardScriptRunning {
+            log("检测到旧网络守护残留；为避免保存错误还原点，本次未修改网络", .error)
+            return false
+        }
         if FileManager.default.fileExists(atPath: snapshotPath) {
-            log("已存在启动前快照，本次不覆盖", .info)
-            return
+            if snapshotIsUsable(at: snapshotPath) {
+                let data = try? Data(contentsOf: URL(fileURLWithPath: snapshotPath))
+                let snapshot = data.flatMap { try? JSONDecoder().decode(RestoreSnapshot.self, from: $0) }
+                let savedServices = Set(snapshot?.networkServices.map(\.service) ?? [])
+                if Set(services).isSubset(of: savedServices),
+                   snapshot?.managedRuntime?.networkServices == managedRuntime.networkServices,
+                   snapshot?.managedRuntime?.bypassDomains == managedRuntime.bypassDomains,
+                   snapshot?.managedRuntime?.proxyHost == managedRuntime.proxyHost,
+                   snapshot?.managedRuntime?.proxyPort == managedRuntime.proxyPort {
+                    log("已存在可用的启动前快照，本次不覆盖", .info)
+                    return true
+                }
+            }
+            log("检测到不匹配的旧快照；为避免覆盖还原点，本次未修改网络", .error)
+            return false
         }
 
         try? FileManager.default.removeItem(atPath: backupDir)
         try? FileManager.default.createDirectory(atPath: backupDir, withIntermediateDirectories: true)
-
-        let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
-        let services = svcResult.stdout.components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("*") }
 
         var networkSnapshots: [NetworkServiceSnapshot] = []
         for service in services {
@@ -1120,22 +1386,36 @@ final class ProxyService: ObservableObject {
             let secure = await CommandRunner.run("/usr/sbin/networksetup", ["-getsecurewebproxy", service])
             let socks = await CommandRunner.run("/usr/sbin/networksetup", ["-getsocksfirewallproxy", service])
             let bypass = await CommandRunner.run("/usr/sbin/networksetup", ["-getproxybypassdomains", service])
+            guard web.succeeded, secure.succeeded, socks.succeeded, bypass.succeeded,
+                  let webSnapshot = parseCompleteProxyEndpoint(web.stdout),
+                  let secureSnapshot = parseCompleteProxyEndpoint(secure.stdout),
+                  let socksSnapshot = parseCompleteProxyEndpoint(socks.stdout)
+            else {
+                try? FileManager.default.removeItem(atPath: backupDir)
+                log("\(service) 当前代理配置读取不完整，已中止且未修改网络", .error)
+                return false
+            }
             networkSnapshots.append(NetworkServiceSnapshot(
                 service: service,
-                web: parseProxyEndpoint(web.stdout),
-                secureWeb: parseProxyEndpoint(secure.stdout),
-                socks: parseProxyEndpoint(socks.stdout),
+                web: webSnapshot,
+                secureWeb: secureSnapshot,
+                socks: socksSnapshot,
                 bypassDomains: parseBypassDomains(bypass.stdout)
             ))
         }
 
-        let paths = managedPaths()
-        let filePaths = paths.chromePaths + paths.mergePaths + [paths.plist, paths.guardScript]
+        let filePaths = paths.chromePaths + paths.mergePaths
         var fileSnapshots: [FileSnapshot] = []
         for (idx, path) in filePaths.enumerated() {
             if FileManager.default.fileExists(atPath: path) {
                 let backupName = "file_\(idx)"
-                try? FileManager.default.copyItem(atPath: path, toPath: "\(backupDir)/\(backupName)")
+                do {
+                    try FileManager.default.copyItem(atPath: path, toPath: "\(backupDir)/\(backupName)")
+                } catch {
+                    try? FileManager.default.removeItem(atPath: backupDir)
+                    log("配置备份失败：\((path as NSString).lastPathComponent)，已中止且未修改网络", .error)
+                    return false
+                }
                 fileSnapshots.append(FileSnapshot(path: path, existed: true, backupName: backupName))
             } else {
                 fileSnapshots.append(FileSnapshot(path: path, existed: false, backupName: nil))
@@ -1145,51 +1425,247 @@ final class ProxyService: ObservableObject {
         var launchdEnvironment: [String: String?] = [:]
         for key in managedEnvKeys {
             let envRes = await CommandRunner.run("/bin/launchctl", ["getenv", key])
-            launchdEnvironment[key] = envRes.succeeded && !envRes.stdout.isEmpty ? envRes.stdout : nil
+            guard envRes.succeeded else {
+                try? FileManager.default.removeItem(atPath: backupDir)
+                log("无法读取环境变量 \(key)，已中止且未修改网络", .error)
+                return false
+            }
+            launchdEnvironment.updateValue(envRes.stdout.isEmpty ? nil : envRes.stdout, forKey: key)
         }
 
         let snapshot = RestoreSnapshot(
+            formatVersion: currentSnapshotFormatVersion,
             createdAt: Date(),
             networkServices: networkSnapshots,
             files: fileSnapshots,
-            launchdEnvironment: launchdEnvironment
+            launchdEnvironment: launchdEnvironment,
+            managedRuntime: managedRuntime
         )
         if let data = try? JSONEncoder().encode(snapshot) {
             try? data.write(to: URL(fileURLWithPath: snapshotPath), options: .atomic)
-            log("启动前配置快照已保存", .success)
-        } else {
-            log("启动前配置快照保存失败，停止时只能执行清理式还原", .warn)
+            if snapshotIsUsable(at: snapshotPath) {
+                log("启动前配置快照已保存并校验", .success)
+                return true
+            }
         }
+        log("启动前配置快照保存失败，已中止启动且未修改网络", .error)
+        return false
     }
 
-    private func restoreEndpoint(_ endpoint: ProxyEndpointSnapshot, service: String, setCommand: String, stateCommand: String) async {
-        if !endpoint.server.isEmpty, let port = Int(endpoint.port) {
-            _ = await CommandRunner.run("/usr/sbin/networksetup", [setCommand, service, endpoint.server, "\(port)"])
+    private func applySystemProxy(
+        endpoint: LocalProxyEndpoint,
+        bypassDomains: [String],
+        services: [String]
+    ) async -> Bool {
+        let setters = ["-setwebproxy", "-setsecurewebproxy", "-setsocksfirewallproxy"]
+        let stateSetters = ["-setwebproxystate", "-setsecurewebproxystate", "-setsocksfirewallproxystate"]
+
+        for service in services {
+            for command in setters {
+                let result = await CommandRunner.run("/usr/sbin/networksetup", [command, service, endpoint.host, "\(endpoint.port)"])
+                guard result.succeeded else {
+                    log("\(service) 代理写入失败: \(result.stderr.isEmpty ? result.stdout : result.stderr)", .error)
+                    return false
+                }
+            }
+            for command in stateSetters {
+                let result = await CommandRunner.run("/usr/sbin/networksetup", [command, service, "on"])
+                guard result.succeeded else {
+                    log("\(service) 代理启用失败: \(result.stderr.isEmpty ? result.stdout : result.stderr)", .error)
+                    return false
+                }
+            }
+            let bypassResult = await CommandRunner.run("/usr/sbin/networksetup", ["-setproxybypassdomains", service] + bypassDomains)
+            guard bypassResult.succeeded else {
+                log("\(service) 绕过列表写入失败: \(bypassResult.stderr.isEmpty ? bypassResult.stdout : bypassResult.stderr)", .error)
+                return false
+            }
+
+            let expected = ProxyEndpointSnapshot(enabled: true, server: endpoint.host, port: "\(endpoint.port)")
+            let web = parseProxyEndpoint((await CommandRunner.run("/usr/sbin/networksetup", ["-getwebproxy", service])).stdout)
+            let secure = parseProxyEndpoint((await CommandRunner.run("/usr/sbin/networksetup", ["-getsecurewebproxy", service])).stdout)
+            let socks = parseProxyEndpoint((await CommandRunner.run("/usr/sbin/networksetup", ["-getsocksfirewallproxy", service])).stdout)
+            let actualBypass = parseBypassDomains((await CommandRunner.run("/usr/sbin/networksetup", ["-getproxybypassdomains", service])).stdout)
+            guard proxyEndpoint(web, matches: expected),
+                  proxyEndpoint(secure, matches: expected),
+                  proxyEndpoint(socks, matches: expected),
+                  Set(normalizedBypassDomains(bypassDomains)).isSubset(of: Set(normalizedBypassDomains(actualBypass)))
+            else {
+                log("\(service) 代理写入后读回校验失败", .error)
+                return false
+            }
         }
-        _ = await CommandRunner.run("/usr/sbin/networksetup", [stateCommand, service, endpoint.enabled ? "on" : "off"])
+        return true
     }
 
-    private func restoreStartupSnapshot() async -> Bool {
-        guard
-            let data = try? Data(contentsOf: URL(fileURLWithPath: snapshotPath)),
-            let snapshot = try? JSONDecoder().decode(RestoreSnapshot.self, from: data)
+    private func monitoredNetworkConfigurationIsValid() async -> Bool {
+        guard let endpoint = monitoredProxyEndpoint, !monitoredNetworkServices.isEmpty else {
+            return false
+        }
+
+        let activeServices = await activePhysicalNetworkServices()
+        guard !activeServices.isEmpty,
+              Set(activeServices).isSubset(of: Set(monitoredNetworkServices))
         else {
             return false
         }
 
-        for item in snapshot.networkServices {
-            await restoreEndpoint(item.web, service: item.service, setCommand: "-setwebproxy", stateCommand: "-setwebproxystate")
-            await restoreEndpoint(item.secureWeb, service: item.service, setCommand: "-setsecurewebproxy", stateCommand: "-setsecurewebproxystate")
-            await restoreEndpoint(item.socks, service: item.service, setCommand: "-setsocksfirewallproxy", stateCommand: "-setsocksfirewallproxystate")
-            if item.bypassDomains.isEmpty {
-                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setproxybypassdomains", item.service, "Empty"])
-            } else {
-                _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setproxybypassdomains", item.service] + item.bypassDomains)
+        let expected = ProxyEndpointSnapshot(enabled: true, server: endpoint.host, port: "\(endpoint.port)")
+        let expectedBypass = Set(normalizedBypassDomains(monitoredBypassDomains))
+        for service in monitoredNetworkServices {
+            let webResult = await CommandRunner.run("/usr/sbin/networksetup", ["-getwebproxy", service])
+            let secureResult = await CommandRunner.run("/usr/sbin/networksetup", ["-getsecurewebproxy", service])
+            let socksResult = await CommandRunner.run("/usr/sbin/networksetup", ["-getsocksfirewallproxy", service])
+            let bypassResult = await CommandRunner.run("/usr/sbin/networksetup", ["-getproxybypassdomains", service])
+            guard webResult.succeeded, secureResult.succeeded, socksResult.succeeded, bypassResult.succeeded,
+                  let web = parseCompleteProxyEndpoint(webResult.stdout),
+                  let secure = parseCompleteProxyEndpoint(secureResult.stdout),
+                  let socks = parseCompleteProxyEndpoint(socksResult.stdout),
+                  proxyEndpoint(web, matches: expected),
+                  proxyEndpoint(secure, matches: expected),
+                  proxyEndpoint(socks, matches: expected),
+                  expectedBypass.isSubset(of: Set(normalizedBypassDomains(parseBypassDomains(bypassResult.stdout))))
+            else {
+                return false
             }
         }
-        await restoreLaunchdEnvironment(snapshot)
+        return true
+    }
 
-        for file in snapshot.files {
+    private func restoreEndpoint(_ endpoint: ProxyEndpointSnapshot, service: String, setCommand: String, stateCommand: String) async -> Bool {
+        var succeeded = true
+        if !endpoint.server.isEmpty, let port = Int(endpoint.port), (1...65535).contains(port) {
+            let result = await CommandRunner.run("/usr/sbin/networksetup", [setCommand, service, endpoint.server, "\(port)"])
+            succeeded = result.succeeded
+        }
+        let stateResult = await CommandRunner.run("/usr/sbin/networksetup", [stateCommand, service, endpoint.enabled ? "on" : "off"])
+        return succeeded && stateResult.succeeded
+    }
+
+    private func proxyEndpoint(_ actual: ProxyEndpointSnapshot, matches expected: ProxyEndpointSnapshot) -> Bool {
+        guard actual.enabled == expected.enabled else { return false }
+        let hasRestorableDormantEndpoint = !expected.server.isEmpty
+            && Int(expected.port).map { (1...65535).contains($0) } == true
+        if !expected.enabled && !hasRestorableDormantEndpoint {
+            return true
+        }
+        return actual.server.caseInsensitiveCompare(expected.server) == .orderedSame
+            && actual.port == expected.port
+    }
+
+    private func normalizedBypassDomains(_ domains: [String]) -> [String] {
+        Array(Set(domains.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty })).sorted()
+    }
+
+    private func verifyRestoredSnapshot(_ snapshot: RestoreSnapshot) async -> [String] {
+        var issues: [String] = []
+
+        for item in snapshot.networkServices {
+            let webResult = await CommandRunner.run("/usr/sbin/networksetup", ["-getwebproxy", item.service])
+            let secureResult = await CommandRunner.run("/usr/sbin/networksetup", ["-getsecurewebproxy", item.service])
+            let socksResult = await CommandRunner.run("/usr/sbin/networksetup", ["-getsocksfirewallproxy", item.service])
+            let bypassResult = await CommandRunner.run("/usr/sbin/networksetup", ["-getproxybypassdomains", item.service])
+            guard webResult.succeeded, secureResult.succeeded, socksResult.succeeded, bypassResult.succeeded,
+                  let web = parseCompleteProxyEndpoint(webResult.stdout),
+                  let secure = parseCompleteProxyEndpoint(secureResult.stdout),
+                  let socks = parseCompleteProxyEndpoint(socksResult.stdout)
+            else {
+                issues.append("\(item.service) 配置读取")
+                continue
+            }
+            let bypass = parseBypassDomains(bypassResult.stdout)
+            if !proxyEndpoint(web, matches: item.web) { issues.append("\(item.service) HTTP 代理") }
+            if !proxyEndpoint(secure, matches: item.secureWeb) { issues.append("\(item.service) HTTPS 代理") }
+            if !proxyEndpoint(socks, matches: item.socks) { issues.append("\(item.service) SOCKS 代理") }
+            if normalizedBypassDomains(bypass) != normalizedBypassDomains(item.bypassDomains) {
+                issues.append("\(item.service) 绕过列表")
+            }
+        }
+
+        let expectedEnvironment = snapshot.launchdEnvironment ?? [:]
+        for key in managedEnvKeys {
+            let result = await CommandRunner.run("/bin/launchctl", ["getenv", key])
+            let expected: String
+            if let stored = expectedEnvironment[key], let value = stored {
+                expected = value
+            } else {
+                expected = ""
+            }
+            if !result.succeeded || result.stdout != expected { issues.append("环境变量 \(key)") }
+        }
+
+        let paths = managedPaths()
+        let guardPaths = Set([paths.plist, paths.guardScript])
+        for file in snapshot.files where !guardPaths.contains(file.path) {
+            if file.existed, let backupName = file.backupName {
+                let expectedURL = URL(fileURLWithPath: "\(backupDir)/\(backupName)")
+                let actualURL = URL(fileURLWithPath: file.path)
+                guard
+                    let expectedData = try? Data(contentsOf: expectedURL),
+                    let actualData = try? Data(contentsOf: actualURL),
+                    expectedData == actualData
+                else {
+                    issues.append("文件 \((file.path as NSString).lastPathComponent)")
+                    continue
+                }
+            } else if FileManager.default.fileExists(atPath: file.path) {
+                issues.append("文件 \((file.path as NSString).lastPathComponent)")
+            }
+        }
+
+        for path in guardPaths where FileManager.default.fileExists(atPath: path) {
+            issues.append("守护文件 \((path as NSString).lastPathComponent)")
+        }
+        if await isLaunchdGuardLoaded() { issues.append("launchd 守护任务") }
+        if await isGuardScriptRunning(paths.guardScript) { issues.append("守护脚本进程") }
+        return issues
+    }
+
+    private func restoreStartupSnapshot() async -> Bool? {
+        guard
+            let data = try? Data(contentsOf: URL(fileURLWithPath: snapshotPath)),
+            let snapshot = try? JSONDecoder().decode(RestoreSnapshot.self, from: data)
+        else {
+            return nil
+        }
+
+        let isCurrentSnapshot = snapshotIsUsable(at: snapshotPath)
+        let isLegacySnapshot = legacySnapshotIsRestorable(snapshot)
+        guard isCurrentSnapshot || isLegacySnapshot else {
+            log("还原快照损坏或内容不完整，已改用受限清理模式", .warn)
+            return nil
+        }
+        if isLegacySnapshot {
+            log("检测到旧版完整快照，将恢复已保存内容并清理旧版未纳入快照的运行配置", .warn)
+        }
+
+        var restoreIssues: [String] = []
+        for item in snapshot.networkServices {
+            if !(await restoreEndpoint(item.web, service: item.service, setCommand: "-setwebproxy", stateCommand: "-setwebproxystate")) {
+                restoreIssues.append("\(item.service) HTTP 代理写入")
+            }
+            if !(await restoreEndpoint(item.secureWeb, service: item.service, setCommand: "-setsecurewebproxy", stateCommand: "-setsecurewebproxystate")) {
+                restoreIssues.append("\(item.service) HTTPS 代理写入")
+            }
+            if !(await restoreEndpoint(item.socks, service: item.service, setCommand: "-setsocksfirewallproxy", stateCommand: "-setsocksfirewallproxystate")) {
+                restoreIssues.append("\(item.service) SOCKS 代理写入")
+            }
+            let bypassResult: CommandResult
+            if item.bypassDomains.isEmpty {
+                bypassResult = await CommandRunner.run("/usr/sbin/networksetup", ["-setproxybypassdomains", item.service, "Empty"])
+            } else {
+                bypassResult = await CommandRunner.run("/usr/sbin/networksetup", ["-setproxybypassdomains", item.service] + item.bypassDomains)
+            }
+            if !bypassResult.succeeded {
+                restoreIssues.append("\(item.service) 绕过列表写入")
+            }
+        }
+        restoreIssues.append(contentsOf: await restoreLaunchdEnvironment(snapshot))
+
+        let paths = managedPaths()
+        let guardPaths = Set([paths.plist, paths.guardScript])
+        for file in snapshot.files where !guardPaths.contains(file.path) {
             let dir = (file.path as NSString).deletingLastPathComponent
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             try? FileManager.default.removeItem(atPath: file.path)
@@ -1198,26 +1674,164 @@ final class ProxyService: ObservableObject {
             }
         }
 
-        try? FileManager.default.removeItem(atPath: backupDir)
-        log("已按启动前快照恢复系统代理、Chrome、Clash 和网络配置", .success)
+        for path in guardPaths {
+            try? FileManager.default.removeItem(atPath: path)
+        }
+
+        if isLegacySnapshot {
+            let savedPaths = Set(snapshot.files.map(\.path))
+            for path in paths.mergePaths where !savedPaths.contains(path) {
+                if !cleanupManagedClashEntries(at: path) {
+                    restoreIssues.append("文件 \((path as NSString).lastPathComponent) 清理")
+                }
+            }
+        }
+
+        let issues = restoreIssues + (await verifyRestoredSnapshot(snapshot))
+        if !issues.isEmpty {
+            log("启动前快照还原未通过校验: \(issues.joined(separator: "；"))", .error)
+            log("还原快照已保留，可再次点击停止重试", .warn)
+            return false
+        }
+
+        do {
+            try FileManager.default.removeItem(atPath: backupDir)
+        } catch {
+            log("还原已通过校验，但快照清理失败: \(error.localizedDescription)", .error)
+            return false
+        }
+        log("已按启动前快照恢复并逐项校验系统代理、环境变量和配置文件", .success)
         return true
     }
 
-    private func cleanupManagedConfigurationWithoutSnapshot(plistPath: String, guardScript: String) async {
-        let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
+    private func cleanupManagedEnvironmentFile(at path: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: path) else { return true }
+        do {
+            let original = try String(contentsOfFile: path, encoding: .utf8)
+            guard let cleaned = NetworkCompatibility.removingManagedEnvironmentBlocks(from: original) else {
+                log("Codex 环境文件中的蝉舒宝标记不完整，已保留原文件", .error)
+                return false
+            }
+            if cleaned != original {
+                try cleaned.write(toFile: path, atomically: true, encoding: .utf8)
+            }
+            let verified = try String(contentsOfFile: path, encoding: .utf8)
+            return verified == cleaned && !NetworkCompatibility.containsManagedEnvironmentMarker(verified)
+        } catch {
+            log("Codex 环境文件清理失败: \(error.localizedDescription)", .error)
+            return false
+        }
+    }
+
+    private func cleanupManagedClashEntries(at path: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: path) else { return true }
+        do {
+            let original = try String(contentsOfFile: path, encoding: .utf8)
+            let cleaned = NetworkCompatibility.removingManagedClashEntries(
+                from: original,
+                companyDomains: companyDomains
+            )
+            if cleaned != original {
+                try cleaned.write(toFile: path, atomically: true, encoding: .utf8)
+            }
+            let verified = try String(contentsOfFile: path, encoding: .utf8)
+            return verified == cleaned && !NetworkCompatibility.containsManagedClashEntries(
+                verified,
+                companyDomains: companyDomains
+            )
+        } catch {
+            log("Clash 配置清理失败（\((path as NSString).lastPathComponent)）: \(error.localizedDescription)", .error)
+            return false
+        }
+    }
+
+    private func cleanupAppOwnedMergeFile(at path: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: path) else { return true }
+        do {
+            let content = try String(contentsOfFile: path, encoding: .utf8)
+            let firstLine = content.components(separatedBy: .newlines)
+                .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard firstLine.hasPrefix("# 蝉舒宝") || firstLine.hasPrefix("# MergeSASE") else {
+                return true
+            }
+            try FileManager.default.removeItem(atPath: path)
+            return !FileManager.default.fileExists(atPath: path)
+        } catch {
+            log("Clash merge 配置清理失败: \(error.localizedDescription)", .error)
+            return false
+        }
+    }
+
+    private func guardManagedProxyEndpoint(at path: String) -> LocalProxyEndpoint? {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        var host: String?
+        var port: Int?
+        for line in content.components(separatedBy: .newlines) {
+            let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n'\""))
+            if key == "PROXY_HOST" || key == "CLASH_HOST" { host = value }
+            if key == "PROXY_PORT" || key == "CLASH_PORT" { port = Int(value) }
+        }
+        guard let host, ["127.0.0.1", "localhost", "::1"].contains(host.lowercased()),
+              let port, (1...65535).contains(port)
+        else {
+            return nil
+        }
+        return LocalProxyEndpoint(host: host, port: port)
+    }
+
+    private func proxyEndpoint(_ snapshot: ProxyEndpointSnapshot, uses endpoint: LocalProxyEndpoint) -> Bool {
+        snapshot.server.caseInsensitiveCompare(endpoint.host) == .orderedSame
+            && snapshot.port == "\(endpoint.port)"
+    }
+
+    private func cleanupManagedConfigurationWithoutSnapshot(plistPath: String, guardScript: String) async -> Bool {
+        var issues: [String] = []
+        guard let managedEndpoint = guardManagedProxyEndpoint(at: guardScript) else {
+            log("无法确认旧守护管理的代理端口，已保留现有网络设置和还原快照", .error)
+            return false
+        }
+        let svcResult = await CommandRunner.run("/usr/sbin/networksetup", ["-listallnetworkservices"])
+        guard svcResult.succeeded else {
+            log("无法读取网络服务，清理式还原已中止", .error)
+            return false
+        }
         let services = svcResult.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
+        var proxyStatesToDisable: [(service: String, stateCommand: String, readCommand: String)] = []
         for service in services {
             let trimmed = service.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty || trimmed.hasPrefix("An asterisk") { continue }
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setwebproxystate", trimmed, "off"])
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsecurewebproxystate", trimmed, "off"])
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsocksfirewallproxystate", trimmed, "off"])
+            if trimmed.isEmpty || trimmed.hasPrefix("An asterisk") || trimmed.hasPrefix("*") { continue }
+            let commands = [
+                (read: "-getwebproxy", state: "-setwebproxystate"),
+                (read: "-getsecurewebproxy", state: "-setsecurewebproxystate"),
+                (read: "-getsocksfirewallproxy", state: "-setsocksfirewallproxystate"),
+            ]
+            for command in commands {
+                let result = await CommandRunner.run("/usr/sbin/networksetup", [command.read, trimmed])
+                guard result.succeeded, let proxy = parseCompleteProxyEndpoint(result.stdout) else {
+                    log("\(trimmed) 当前代理配置读取不完整，受限清理已中止", .error)
+                    return false
+                }
+                if proxy.enabled, proxyEndpoint(proxy, uses: managedEndpoint) {
+                    proxyStatesToDisable.append((trimmed, command.state, command.read))
+                }
+            }
+        }
+        for target in proxyStatesToDisable {
+            let result = await CommandRunner.run("/usr/sbin/networksetup", [target.stateCommand, target.service, "off"])
+            if !result.succeeded {
+                issues.append("\(target.service) 系统代理关闭")
+            }
         }
         systemProxyEnabled = false
-        log("未找到启动前快照，已执行清理式系统代理关闭", .warn)
+        log("未找到可用启动前快照，仅关闭了与旧守护端口一致的系统代理", .warn)
 
         for key in managedEnvKeys {
-            _ = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
+            let result = await CommandRunner.run("/bin/launchctl", ["unsetenv", key])
+            if !result.succeeded { issues.append("环境变量 \(key) 清理") }
         }
         appEnvFixed = false
         log("已清理 HTTP_PROXY/NO_PROXY 等应用环境变量", .info)
@@ -1232,24 +1846,163 @@ final class ProxyService: ObservableObject {
             "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles/merge.yaml",
         ]
         for path in mergePaths {
-            if FileManager.default.fileExists(atPath: path) {
-                try? FileManager.default.removeItem(atPath: path)
-                log("已清理 merge 配置: \((path as NSString).lastPathComponent)", .success)
+            if !cleanupAppOwnedMergeFile(at: path) {
+                issues.append("Clash merge 配置")
             }
         }
 
-        try? FileManager.default.removeItem(atPath: plistPath)
-        try? FileManager.default.removeItem(atPath: guardScript)
-        guardLoaded = false
-        log("配置文件已清理", .info)
+        let codexEnvPath = "\(homeDir)/.codex/.env"
+        if !cleanupManagedEnvironmentFile(at: codexEnvPath) {
+            issues.append("Codex 环境文件")
+        }
+
+        let clashRuntimePaths = [
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/dns_config.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml",
+            "\(homeDir)/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge-check.yaml",
+        ]
+        for path in clashRuntimePaths where !cleanupManagedClashEntries(at: path) {
+            issues.append("Clash 运行配置 \((path as NSString).lastPathComponent)")
+        }
+
+        for target in proxyStatesToDisable {
+            let result = await CommandRunner.run("/usr/sbin/networksetup", [target.readCommand, target.service])
+            guard result.succeeded, let proxy = parseCompleteProxyEndpoint(result.stdout) else {
+                issues.append("\(target.service) 配置读取")
+                continue
+            }
+            if proxy.enabled { issues.append("\(target.service) 系统代理") }
+        }
+        for key in managedEnvKeys {
+            let result = await CommandRunner.run("/bin/launchctl", ["getenv", key])
+            if !result.succeeded || !result.stdout.isEmpty {
+                issues.append("环境变量 \(key)")
+            }
+        }
+        let chromePreference = await CommandRunner.run("/usr/bin/defaults", [
+            "read", "\(homeDir)/Library/Preferences/com.google.Chrome.plist", "ProxySettings"
+        ])
+        if chromePreference.succeeded { issues.append("Chrome 代理策略") }
+        if FileManager.default.fileExists(atPath: "\(homeDir)/Library/Application Support/Google/Chrome/Managed/com.google.Chrome.plist") {
+            issues.append("Chrome Managed 配置")
+        }
+        for path in mergePaths where FileManager.default.fileExists(atPath: path) {
+            if let content = try? String(contentsOfFile: path, encoding: .utf8) {
+                let firstLine = content.components(separatedBy: .newlines)
+                    .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if firstLine.hasPrefix("# 蝉舒宝") || firstLine.hasPrefix("# MergeSASE") {
+                    issues.append("Clash merge 配置")
+                }
+            } else {
+                issues.append("Clash merge 配置读取")
+            }
+        }
+        if FileManager.default.fileExists(atPath: codexEnvPath) {
+            guard let content = try? String(contentsOfFile: codexEnvPath, encoding: .utf8) else {
+                issues.append("Codex 环境文件读取")
+                return false
+            }
+            if NetworkCompatibility.containsManagedEnvironmentMarker(content) {
+                issues.append("Codex 环境文件")
+            }
+        }
+        for path in clashRuntimePaths where FileManager.default.fileExists(atPath: path) {
+            guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+                issues.append("Clash 运行配置读取")
+                continue
+            }
+            if NetworkCompatibility.containsManagedClashEntries(content, companyDomains: companyDomains) {
+                issues.append("Clash 运行配置 \((path as NSString).lastPathComponent)")
+            }
+        }
+        if await isLaunchdGuardLoaded() { issues.append("launchd 守护任务") }
+        if await isGuardScriptRunning(guardScript) { issues.append("守护脚本进程") }
+
+        guardLoaded = await isLaunchdGuardLoaded()
+        if !issues.isEmpty {
+            log("清理式还原未通过校验: \(issues.joined(separator: "；"))", .error)
+            return false
+        }
+
+        log("受管配置已清理并校验，守护元数据保留到清理事务提交", .info)
+        log("清理式还原已逐项校验", .success)
+        return true
     }
 
-    private func restoreOrCleanupManagedConfiguration(plistPath: String, guardScript: String) async -> Bool {
-        let restoredFromSnapshot = await restoreStartupSnapshot()
-        if !restoredFromSnapshot {
-            await cleanupManagedConfigurationWithoutSnapshot(plistPath: plistPath, guardScript: guardScript)
+    private func removeGuardMetadataFiles(plistPath: String, guardScript: String) -> Bool {
+        if FileManager.default.fileExists(atPath: plistPath) {
+            do {
+                try FileManager.default.removeItem(atPath: plistPath)
+            } catch {
+                log("launchd 配置文件清理失败，已保留守护脚本供再次重试", .error)
+                return false
+            }
         }
-        return restoredFromSnapshot
+        if FileManager.default.fileExists(atPath: guardScript) {
+            do {
+                try FileManager.default.removeItem(atPath: guardScript)
+            } catch {
+                log("守护脚本清理失败，可再次点击停止重试", .error)
+                return false
+            }
+        }
+        if FileManager.default.fileExists(atPath: plistPath)
+            || FileManager.default.fileExists(atPath: guardScript) {
+            log("配置文件清理后仍有残留，可再次点击停止重试", .error)
+            return false
+        }
+        log("配置文件已清理", .info)
+        return true
+    }
+
+    private func restoreOrCleanupManagedConfiguration(plistPath: String, guardScript: String) async -> (restoredFromSnapshot: Bool, succeeded: Bool) {
+        if let restored = await restoreStartupSnapshot() {
+            return (true, restored)
+        }
+        let corruptSnapshotExists = FileManager.default.fileExists(atPath: snapshotPath)
+        let cleaned = await cleanupManagedConfigurationWithoutSnapshot(plistPath: plistPath, guardScript: guardScript)
+        guard cleaned else { return (false, false) }
+        if corruptSnapshotExists {
+            do {
+                try FileManager.default.removeItem(atPath: backupDir)
+                log("损坏的还原快照已在清理完成后移除", .info)
+            } catch {
+                log("配置已清理，但损坏快照无法移除；已保留守护脚本供再次重试: \(error.localizedDescription)", .error)
+                return (false, false)
+            }
+        }
+        let metadataRemoved = removeGuardMetadataFiles(plistPath: plistPath, guardScript: guardScript)
+        return (false, metadataRemoved)
+    }
+
+    private func reloadClashViaAPI(
+        address: String,
+        secret: String,
+        force: Bool,
+        configPath: String? = nil
+    ) async -> Bool {
+        let payload: String
+        if let configPath,
+           let data = try? JSONSerialization.data(withJSONObject: ["path": configPath]),
+           let json = String(data: data, encoding: .utf8) {
+            payload = json
+        } else {
+            payload = "{}"
+        }
+
+        let suffix = force ? "/configs?force=true" : "/configs"
+        var arguments = [
+            "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+            "-X", "PUT", "http://\(address)\(suffix)",
+            "-H", "Content-Type: application/json",
+        ]
+        if !secret.isEmpty {
+            arguments.append(contentsOf: ["-H", "Authorization: Bearer \(secret)"])
+        }
+        arguments.append(contentsOf: ["-d", payload])
+        let result = await CommandRunner.run("/usr/bin/curl", arguments)
+        return result.succeeded && (result.stdout == "200" || result.stdout == "204")
     }
 
     private func reloadClashAfterRestore() async {
@@ -1277,30 +2030,43 @@ final class ProxyService: ObservableObject {
             }
             break
         }
-        var authPart = ""
-        if !secret.isEmpty { authPart = "-H 'Authorization: Bearer \(secret)'" }
-        _ = await CommandRunner.runShell(
-            "curl -s -o /dev/null -X PUT 'http://127.0.0.1:9097/configs?force=true' -H 'Content-Type: application/json' \(authPart) -d '{}' 2>/dev/null"
-        )
-        log("Clash 配置已通过 API 重载", .info)
+        if await reloadClashViaAPI(address: "127.0.0.1:9097", secret: secret, force: true) {
+            log("Clash 配置已通过 API 重载", .success)
+        } else {
+            log("Clash 配置已恢复，但未确认热重载结果；下次启动 Clash 时会读取恢复后的配置", .warn)
+        }
     }
 
     private func failStartAndRestore(_ reason: String) async {
+        invalidateStatusRefreshes()
         log("启动失败: \(reason)", .error)
         phase = .stopping
         statusMessage = "启动失败，正在自动恢复…"
 
         let plistPath = "\(homeDir)/Library/LaunchAgents/com.clash.proxyguard.plist"
         let guardScript = "\(homeDir)/.local/bin/clash-proxy-guard.sh"
-        _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
-        guardLoaded = false
+        guard await stopLaunchdGuard(plistPath: plistPath, guardScript: guardScript) else {
+            startupFailureCleanupCompleted = false
+            phase = .error
+            statusMessage = "启动失败，守护未停止"
+            log("========== 启动失败，守护仍在运行，未执行配置还原 ==========", .error)
+            return
+        }
 
-        let restoredFromSnapshot = await restoreOrCleanupManagedConfiguration(plistPath: plistPath, guardScript: guardScript)
+        let restoreResult = await restoreOrCleanupManagedConfiguration(plistPath: plistPath, guardScript: guardScript)
         await reloadClashAfterRestore()
         await refreshStatus()
-        startupFailureCleanupCompleted = true
+        startupFailureCleanupCompleted = restoreResult.succeeded && !guardLoaded
+        if startupFailureCleanupCompleted {
+            monitoredNetworkServices = []
+            monitoredBypassDomains = []
+            monitoredProxyEndpoint = nil
+        }
         phase = .error
-        if restoredFromSnapshot {
+        if !restoreResult.succeeded || guardLoaded {
+            statusMessage = "启动失败，还原未完成"
+            log("========== 启动失败，还原未通过校验，可点击中止并还原重试 ==========", .error)
+        } else if restoreResult.restoredFromSnapshot {
             statusMessage = "启动失败，已自动恢复"
             log("========== 启动失败，已自动恢复 ==========", .warn)
         } else {
@@ -1310,8 +2076,12 @@ final class ProxyService: ObservableObject {
     }
 
     func addDomain(_ domain: String) {
-        let trimmed = normalizedHost(domain)
-        guard !trimmed.isEmpty, !companyDomains.map(normalizedHost).contains(trimmed) else { return }
+        guard let trimmed = NetworkCompatibility.normalizedDomain(domain) else {
+            statusMessage = "域名格式不正确"
+            log("公司域名格式不正确，只能填写类似 example.com 的域名", .warn)
+            return
+        }
+        guard !companyDomains.map(normalizedHost).contains(trimmed) else { return }
         companyDomains.append(trimmed)
     }
 
@@ -1664,131 +2434,174 @@ final class ProxyService: ObservableObject {
         return 7897
     }
 
-    private func systemProxyEndpoint() async -> (host: String, port: Int)? {
-        let proxy = await CommandRunner.runShell("scutil --proxy 2>/dev/null")
-        guard proxy.stdout.contains("HTTPEnable : 1") else { return nil }
-
-        var host = "127.0.0.1"
-        var port: Int?
-        if let range = proxy.stdout.range(of: "HTTPProxy : ") {
-            host = proxy.stdout[range.upperBound...].components(separatedBy: "\n").first?.trimmingCharacters(in: .whitespaces) ?? host
-        }
-        if let range = proxy.stdout.range(of: "HTTPPort : ") {
-            let portStr = proxy.stdout[range.upperBound...].components(separatedBy: "\n").first?.trimmingCharacters(in: .whitespaces) ?? ""
-            port = Int(portStr)
-        }
-        guard let port else { return nil }
-        return (host, port)
+    private func proxyURL(for endpoint: LocalProxyEndpoint) -> String {
+        let host = endpoint.host.contains(":") ? "[\(endpoint.host)]" : endpoint.host
+        return "http://\(host):\(endpoint.port)"
     }
 
-    private func detectShadowrocketPort() async -> Int? {
-        let lsofRes = await CommandRunner.runShell(
-            "lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -iE 'Shadowrocket|shadowrocket' | grep -o '127\\.0\\.0\\.1:[0-9]\\+' | cut -d: -f2 | head -1"
-        )
-        if let port = Int(lsofRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)), port > 0 {
-            return port
-        }
-        for port in [1087, 1080, 7890, 7897, 6152] {
-            let check = await CommandRunner.runShell("nc -z 127.0.0.1 \(port) >/dev/null 2>&1 && echo 1 || echo 0")
-            if check.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
-                return port
-            }
-        }
-        return nil
+    private func proxyEndpointIsHealthy(_ endpoint: LocalProxyEndpoint) async -> Bool {
+        let result = await CommandRunner.run("/usr/bin/env", [
+            "-u", "ALL_PROXY", "-u", "all_proxy",
+            "-u", "HTTPS_PROXY", "-u", "https_proxy",
+            "-u", "HTTP_PROXY", "-u", "http_proxy",
+            "-u", "NO_PROXY", "-u", "no_proxy",
+            "/usr/bin/curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+            "--connect-timeout", "2", "--max-time", "4",
+            "--proxy", proxyURL(for: endpoint),
+            "https://www.gstatic.com/generate_204"
+        ])
+        return result.succeeded && result.stdout == "204"
     }
 
-    private func detectExternalProxyClient() async -> ExternalProxyDetection {
-        let systemEndpoint = await systemProxyEndpoint()
-        let preference = externalProxyPreference
+    private var configuredShadowrocketPort: Int? {
+        let value = shadowrocketPortText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let port = Int(value), (1...65535).contains(port) else { return nil }
+        return port
+    }
 
-        func processContains(_ pattern: String) async -> Bool {
-            let result = await CommandRunner.runShell("pgrep -if '\(pattern)' >/dev/null && echo 1 || echo 0")
-            return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+    private func executablePath(for pid: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let length = buffer.withUnsafeMutableBytes { bytes in
+            proc_pidpath(pid, bytes.baseAddress, UInt32(bytes.count))
         }
+        guard length > 0 else { return nil }
+        return String(cString: buffer)
+    }
 
-        let shadowrocketRunning = await processContains("Shadowrocket|shadowrocket")
-        let clashRunningNow = await detectClashRunning(port: systemEndpoint?.port ?? clashPort)
+    private func listenerPIDs(onLoopbackPort port: Int) async -> Set<Int32> {
+        let result = await CommandRunner.run("/usr/sbin/lsof", [
+            "-nP", "-a", "-iTCP:\(port)", "-sTCP:LISTEN", "-Fpn"
+        ])
+        guard result.succeeded else { return [] }
 
-        if preference == .shadowrocket {
-            let port: Int
-            if let detectedPort = await detectShadowrocketPort() {
-                port = detectedPort
-            } else if let systemPort = systemEndpoint?.port {
-                port = systemPort
-            } else {
-                port = 1087
+        var currentPID: Int32?
+        var pids = Set<Int32>()
+        let exactName = "n127.0.0.1:\(port)"
+        let wildcardName = "n*:\(port)"
+        for line in result.stdout.components(separatedBy: .newlines) {
+            if line.hasPrefix("p") {
+                currentPID = Int32(line.dropFirst())
+            } else if let currentPID,
+                      line == exactName || line == wildcardName
+                        || line.hasPrefix("\(exactName) ") || line.hasPrefix("\(wildcardName) ") {
+                pids.insert(currentPID)
             }
+        }
+        return pids
+    }
+
+    private func shadowrocketOwnsListeningPort(_ port: Int) async -> Bool {
+        let initialPIDs = await listenerPIDs(onLoopbackPort: port)
+        for pid in initialPIDs {
+            guard let path = executablePath(for: pid),
+                  NetworkCompatibility.isShadowrocketExecutablePath(path)
+            else {
+                continue
+            }
+            let confirmedPIDs = await listenerPIDs(onLoopbackPort: port)
+            if confirmedPIDs.contains(pid) { return true }
+        }
+        return false
+    }
+
+    private func shadowrocketDetection(connected: Bool) async -> ExternalProxyDetection {
+        guard connected else {
             return ExternalProxyDetection(
                 displayName: "Shadowrocket",
-                detail: shadowrocketRunning ? "127.0.0.1:\(port)" : "未检测到 Shadowrocket 进程",
-                host: systemEndpoint?.host ?? "127.0.0.1",
-                port: port,
-                running: shadowrocketRunning,
+                detail: "未连接，请先在小火箭中连接",
+                running: false,
                 supportsClashConfig: false
             )
         }
 
+        let manualValue = shadowrocketPortText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !manualValue.isEmpty else {
+            return ExternalProxyDetection(
+                displayName: "Shadowrocket",
+                detail: "请填写小火箭设置中的 Proxy Port",
+                running: false,
+                supportsClashConfig: false
+            )
+        }
+        guard let configuredShadowrocketPort else {
+            return ExternalProxyDetection(
+                displayName: "Shadowrocket",
+                detail: "代理端口格式不正确",
+                running: false,
+                supportsClashConfig: false
+            )
+        }
+        guard await shadowrocketOwnsListeningPort(configuredShadowrocketPort) else {
+            return ExternalProxyDetection(
+                displayName: "Shadowrocket",
+                detail: "该端口不是小火箭正在监听的 Proxy Port",
+                port: configuredShadowrocketPort,
+                running: false,
+                supportsClashConfig: false
+            )
+        }
+        let endpoint = LocalProxyEndpoint(host: "127.0.0.1", port: configuredShadowrocketPort)
+
+        let healthy = await proxyEndpointIsHealthy(endpoint)
+        return ExternalProxyDetection(
+            displayName: "Shadowrocket",
+            detail: healthy ? "已连接 · \(endpoint.host):\(endpoint.port)" : "已连接，但代理端口不可用",
+            host: endpoint.host,
+            port: endpoint.port,
+            running: healthy,
+            supportsClashConfig: false
+        )
+    }
+
+    private func detectExternalProxyClient() async -> ExternalProxyDetection {
+        let preference = externalProxyPreference
+        let networkConnections = await CommandRunner.run("/usr/sbin/scutil", ["--nc", "list"])
+        let shadowrocketConnected = networkConnections.succeeded
+            && NetworkCompatibility.shadowrocketIsConnected(in: networkConnections.stdout)
+        let clashDetectedPort = await detectClashPort()
+        let clashRunningNow = await detectClashRunning(port: clashDetectedPort)
+        let clashEndpoint = LocalProxyEndpoint(host: "127.0.0.1", port: clashDetectedPort)
+        let clashHealthy = clashRunningNow ? await proxyEndpointIsHealthy(clashEndpoint) : false
+
+        if preference == .shadowrocket {
+            return await shadowrocketDetection(connected: shadowrocketConnected)
+        }
+
         if preference == .clash {
-            let port = await detectClashPort()
             return ExternalProxyDetection(
                 displayName: "Clash",
-                detail: "127.0.0.1:\(port)",
-                host: "127.0.0.1",
-                port: port,
-                running: clashRunningNow,
+                detail: clashHealthy ? "已验证 · 127.0.0.1:\(clashDetectedPort)" : "进程或代理端口不可用",
+                host: clashEndpoint.host,
+                port: clashEndpoint.port,
+                running: clashHealthy,
                 supportsClashConfig: true
             )
         }
 
-        if shadowrocketRunning, !clashRunningNow {
-            let port: Int
-            if let systemPort = systemEndpoint?.port {
-                port = systemPort
-            } else {
-                port = await detectShadowrocketPort() ?? 1087
-            }
+        if clashHealthy {
             return ExternalProxyDetection(
-                displayName: "Shadowrocket",
-                detail: "127.0.0.1:\(port)",
-                host: systemEndpoint?.host ?? "127.0.0.1",
-                port: port,
+                displayName: "Clash",
+                detail: "已验证 · 127.0.0.1:\(clashDetectedPort)",
+                host: clashEndpoint.host,
+                port: clashEndpoint.port,
                 running: true,
-                supportsClashConfig: false
+                supportsClashConfig: true
             )
         }
 
-        let port: Int
-        if let systemPort = systemEndpoint?.port {
-            port = systemPort
-        } else {
-            port = await detectClashPort()
+        if shadowrocketConnected {
+            return await shadowrocketDetection(connected: true)
         }
+
         return ExternalProxyDetection(
-            displayName: "Clash",
-            detail: "127.0.0.1:\(port)",
-            host: systemEndpoint?.host ?? "127.0.0.1",
-            port: port,
-            running: clashRunningNow,
-            supportsClashConfig: true
+            displayName: "未检测",
+            detail: "请先连接 Clash 或 Shadowrocket",
+            running: false,
+            supportsClashConfig: false
         )
     }
 
     private func writeMergeConfig(port: Int) async {
-        // Resolve company domains to find internal IP ranges
-        var internalRanges = Set(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"])
-        let nameservers = await systemNameservers()
-        for domain in companyDomains {
-            for prefix in ["", "new-api", "api", "www", "portal", "vpn"] {
-                let host = prefix.isEmpty ? domain : "\(prefix).\(domain)"
-                if let ip = await resolveRealIPv4(host, nameservers: nameservers), let range = routeRange(for: ip) {
-                    internalRanges.insert(range)
-                    log("检测到公司内网 IP: \(host) → \(ip) → 排除路由 \(range)", .info)
-                    break
-                }
-            }
-        }
-
-        let routeExcludeYAML = internalRanges.sorted().map { "          - '\($0)'" }.joined(separator: "\n")
         let fakeIPFilterItems = companyDomains.flatMap { domain -> [String] in
             if domainHasProxyRequiredHost(domain) {
                 return directCompanyHosts.filter { host($0, isUnder: domain) }
@@ -1811,14 +2624,6 @@ final class ProxyService: ObservableObject {
         \(fakeIPFilterYAML)
           nameserver-policy:
         \(nameserverPolicyYAML)
-
-        tun:
-          enable: true
-          stack: system
-          route-exclude-address:
-        \(routeExcludeYAML)
-          route-exclude:
-        \(routeExcludeYAML)
         """
 
         // Write to Clash Verge merge config locations
@@ -1985,25 +2790,13 @@ final class ProxyService: ObservableObject {
             }
 
             log("正在通过 API 重载 Clash...", .info)
-            var authPart = ""
-            if !secret.isEmpty { authPart = "-H 'Authorization: Bearer \(secret)'" }
 
-            // Try with path parameter
-            let apiRes = await CommandRunner.runShell(
-                "curl -s -o /dev/null -w '%{http_code}' -X PUT 'http://\(apiAddr)/configs?force=true' -H 'Content-Type: application/json' \(authPart) -d '{\"path\":\"\(configPath)\"}' 2>/dev/null"
-            )
-            if apiRes.stdout == "200" || apiRes.stdout == "204" {
+            if await reloadClashViaAPI(address: apiAddr, secret: secret, force: true, configPath: configPath) {
                 log("Clash 配置已重载 (API)", .success)
                 reloaded = true
-            } else {
-                // Try without path
-                let retryRes = await CommandRunner.runShell(
-                    "curl -s -o /dev/null -w '%{http_code}' -X PUT 'http://\(apiAddr)/configs' -H 'Content-Type: application/json' \(authPart) -d '{}' 2>/dev/null"
-                )
-                if retryRes.stdout == "200" || retryRes.stdout == "204" {
-                    log("Clash 配置已重载 (API)", .success)
-                    reloaded = true
-                }
+            } else if await reloadClashViaAPI(address: apiAddr, secret: secret, force: false) {
+                log("Clash 配置已重载 (API)", .success)
+                reloaded = true
             }
         }
 
@@ -2022,81 +2815,125 @@ final class ProxyService: ObservableObject {
     // MARK: - Start
 
     func start() async {
+        invalidateStatusRefreshes()
+        guard phase != .starting, phase != .stopping else { return }
+        guard !guardNeedsStopping else {
+            statusMessage = "请先停止并恢复现有守护"
+            log("已有网络守护或还原快照，本次未重复启动", .warn)
+            return
+        }
         startupFailureCleanupCompleted = false
         phase = .starting
         statusMessage = "启动中…"
         log("========== 开始启动 ==========")
 
+        let existingPaths = managedPaths()
+        let liveGuardLoaded = await isLaunchdGuardLoaded()
+        let liveGuardScriptRunning = await isGuardScriptRunning(existingPaths.guardScript)
+        guard phase == .starting else { return }
+        if liveGuardLoaded || liveGuardScriptRunning {
+            guardLoaded = liveGuardLoaded
+            phase = .idle
+            statusMessage = "请先停止并恢复现有守护"
+            log("检测到仍在运行的旧网络守护，本次未创建新快照", .warn)
+            return
+        }
+
+        let validDomains = companyDomains.compactMap(NetworkCompatibility.normalizedDomain)
+        guard !validDomains.isEmpty, validDomains.count == companyDomains.count else {
+            phase = .idle
+            statusMessage = "请检查公司域名"
+            log("启动中止：公司域名为空或格式不正确，未修改网络", .error)
+            return
+        }
+
         let vpn = await detectCompanyVPNClient()
         vpnClientName = vpn.displayName
         vpnClientDetail = vpn.detail
         vpnClientRunning = vpn.running
-        if vpn.running {
-            log("检测到公司 VPN: \(vpn.displayName)（\(vpn.detail)）", .success)
-        } else {
-            log("未检测到 SASE/OpenVPN Connect，公司内网需要先连接 VPN", .warn)
+        guard vpn.running else {
+            phase = .idle
+            statusMessage = "请先连接公司 VPN"
+            log("启动中止：未确认公司 VPN 已连接，未修改网络", .error)
+            return
         }
+        log("检测到公司 VPN: \(vpn.displayName)（\(vpn.detail)）", .success)
 
         let externalProxy = await detectExternalProxyClient()
         proxyHost = externalProxy.host
         clashPort = externalProxy.port
         clashRunning = externalProxy.running
         externalProxyName = externalProxy.displayName
-            externalProxyDetail = externalProxy.detail
-            externalProxyRunning = externalProxy.running
-            externalProxySupportsClashConfig = externalProxy.supportsClashConfig
-            log("检测到外网代理: \(externalProxy.displayName) \(externalProxy.detail)", externalProxy.running ? .success : .warn)
-            if !externalProxy.running {
-                log("外网代理未运行，请先打开 \(externalProxy.displayName) 或切换代理选择", .warn)
-            }
+        externalProxyDetail = externalProxy.detail
+        externalProxyRunning = externalProxy.running
+        externalProxySupportsClashConfig = externalProxy.supportsClashConfig
+        guard externalProxy.running else {
+            phase = .idle
+            statusMessage = externalProxy.detail
+            log("启动中止：外网代理未通过连接和请求验证，未修改网络", .error)
+            return
+        }
+        log("外网代理已验证: \(externalProxy.displayName) \(externalProxy.detail)", .success)
 
-        await takeRestoreSnapshotIfNeeded()
+        let activeServices = await activePhysicalNetworkServices()
+        guard !activeServices.isEmpty else {
+            phase = .idle
+            statusMessage = "未找到活动网络"
+            log("启动中止：未找到正在使用的 Wi-Fi 或有线网络，未修改网络", .error)
+            return
+        }
+        log("仅配置活动网络服务: \(activeServices.joined(separator: ", "))", .info)
+
+        let startupNameservers = await systemNameservers()
+        let guardBypassItems = await managedBypassItems(nameservers: startupNameservers)
+        let managedRuntime = ManagedRuntimeSnapshot(
+            networkServices: activeServices,
+            bypassDomains: guardBypassItems,
+            proxyHost: externalProxy.host,
+            proxyPort: externalProxy.port
+        )
+        guard await takeRestoreSnapshotIfNeeded(for: activeServices, managedRuntime: managedRuntime) else {
+            phase = .idle
+            statusMessage = "启动失败：无法保存还原点"
+            log("========== 启动中止：没有可靠还原点 ==========", .error)
+            return
+        }
 
         if externalProxy.supportsClashConfig {
             await writeMergeConfig(port: externalProxy.port)
         } else {
-            log("当前外网代理为 \(externalProxy.displayName)，跳过 Clash 专属 fake-ip/route-exclude 写入；请在 \(externalProxy.displayName) 里确保公司域名直连", .info)
+            log("Shadowrocket 兼容模式：不会修改小火箭 TUN；最终以内网和外网实测结果为准", .warn)
         }
 
         // Generate guard script — include resolved IP ranges
         let guardDir = "\(homeDir)/.local/bin"
         let guardScript = "\(guardDir)/clash-proxy-guard.sh"
         try? FileManager.default.createDirectory(atPath: guardDir, withIntermediateDirectories: true, attributes: nil)
-        let startupNameservers = await systemNameservers()
-        var guardBypassItems = ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
-                                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"]
-        for domain in companyDomains {
-            guardBypassItems.append(contentsOf: broadBypassItems(for: domain))
-            if let ip = await resolveRealIPv4(domain, nameservers: startupNameservers), let range = routeRange(for: ip) {
-                guardBypassItems.append(range)
-            }
-        }
-        // Deduplicate
-        var seenGuard = Set<String>()
-        guardBypassItems = guardBypassItems.filter { seenGuard.insert($0).inserted }
 
-        let guardBypassStr = guardBypassItems.map { "\"\($0)\"" }.joined(separator: " ")
-        let domainLines = companyDomains.map { "    \"\($0)\"" }.joined(separator: "\n")
-        let proxyRequiredLines = proxyRequiredHosts.map { "    \"\($0)\"" }.joined(separator: "\n")
+        let guardBypassStr = guardBypassItems.map(shellQuoted).joined(separator: " ")
+        let serviceLines = activeServices.map { "  \(shellQuoted($0))" }.joined(separator: "\n")
+        let guardEndpoint = LocalProxyEndpoint(host: externalProxy.host, port: externalProxy.port)
         let guardContent = """
         #!/bin/bash
-        CLASH_HOST="\(externalProxy.host)"
-        CLASH_PORT="\(externalProxy.port)"
-        COMPANY_DOMAINS=(
-        \(domainLines)
-        )
-        PROXY_REQUIRED_HOSTS=(
-        \(proxyRequiredLines)
+        PROXY_HOST=\(shellQuoted(externalProxy.host))
+        PROXY_PORT=\(externalProxy.port)
+        PROXY_URL=\(shellQuoted(proxyURL(for: guardEndpoint)))
+        NETWORK_SERVICES=(
+        \(serviceLines)
         )
         BYPASS=(\(guardBypassStr))
-        while IFS= read -r service; do
-            [ -z "$service" ] && continue
-            case "$service" in \\**) continue ;; esac
-            networksetup -setwebproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null || true
-            networksetup -setsecurewebproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null || true
-            networksetup -setsocksfirewallproxy "$service" "$CLASH_HOST" "$CLASH_PORT" 2>/dev/null || true
-            networksetup -setproxybypassdomains "$service" "${BYPASS[@]}" 2>/dev/null || true
-        done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+        STATUS=$(/usr/bin/curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 4 \
+          --proxy "$PROXY_URL" https://www.gstatic.com/generate_204) || exit 1
+        [ "$STATUS" = "204" ] || exit 1
+        for service in "${NETWORK_SERVICES[@]}"; do
+            /usr/sbin/networksetup -setwebproxy "$service" "$PROXY_HOST" "$PROXY_PORT" >/dev/null || exit 1
+            /usr/sbin/networksetup -setsecurewebproxy "$service" "$PROXY_HOST" "$PROXY_PORT" >/dev/null || exit 1
+            /usr/sbin/networksetup -setsocksfirewallproxy "$service" "$PROXY_HOST" "$PROXY_PORT" >/dev/null || exit 1
+            /usr/sbin/networksetup -setwebproxystate "$service" on >/dev/null || exit 1
+            /usr/sbin/networksetup -setsecurewebproxystate "$service" on >/dev/null || exit 1
+            /usr/sbin/networksetup -setsocksfirewallproxystate "$service" on >/dev/null || exit 1
+            /usr/sbin/networksetup -setproxybypassdomains "$service" "${BYPASS[@]}" >/dev/null || exit 1
+        done
         """
         do {
             try guardContent.write(toFile: guardScript, atomically: true, encoding: .utf8)
@@ -2139,39 +2976,34 @@ final class ProxyService: ObservableObject {
             log("launchd 配置已写入", .success)
         } catch {
             log("launchd 配置写入失败: \(error.localizedDescription)", .error)
-            log("已跳过自动网络守护；系统代理、Chrome、Clash 仍会继续配置。请检查 ~/Library/LaunchAgents 权限后重试。", .warn)
+            await failStartAndRestore("无法创建网络守护")
+            return
         }
 
         // Set system proxy — include resolved IP ranges in bypass
-        var bypassList = ["127.0.0.1", "localhost", "*.local", "169.254.0.0/16",
-                          "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "197.19.0.0/16"]
-        for domain in companyDomains {
-            bypassList.append(contentsOf: broadBypassItems(for: domain))
-            if let ip = await resolveRealIPv4(domain, nameservers: startupNameservers), let range = routeRange(for: ip) {
-                bypassList.append(range)
-            }
+        let bypassList = guardBypassItems
+        let endpoint = LocalProxyEndpoint(host: externalProxy.host, port: externalProxy.port)
+        guard await setLaunchdNoProxy(bypassList), await setLaunchdProxy(endpoint: endpoint) else {
+            await failStartAndRestore("应用代理环境变量未生效")
+            return
         }
-        // Deduplicate while preserving order
-        var seen = Set<String>()
-        bypassList = bypassList.filter { seen.insert($0).inserted }
-        await setLaunchdNoProxy(bypassList)
-        await setLaunchdProxy(port: externalProxy.port)
-        await writeAppEnvironment(port: externalProxy.port, bypassItems: bypassList)
+        await writeAppEnvironment(endpoint: endpoint, bypassItems: bypassList)
+        guard appEnvFixed else {
+            await failStartAndRestore("Codex 代理环境未生效")
+            return
+        }
         if !proxyRequiredHosts.isEmpty {
             log("以下 API 域名将强制走外网代理，不写入绕过: \(proxyRequiredHosts.joined(separator: ", "))", .info)
         }
 
-        let svcResult = await CommandRunner.runShell("networksetup -listallnetworkservices 2>/dev/null | tail -n +2")
-        let services = svcResult.stdout.components(separatedBy: "\n").filter { !$0.isEmpty }
-        for service in services {
-            let trimmed = service.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty || trimmed.hasPrefix("An asterisk") { continue }
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setwebproxy", trimmed, proxyHost, "\(externalProxy.port)"])
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsecurewebproxy", trimmed, proxyHost, "\(externalProxy.port)"])
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setsocksfirewallproxy", trimmed, proxyHost, "\(externalProxy.port)"])
-            _ = await CommandRunner.run("/usr/sbin/networksetup", ["-setproxybypassdomains", trimmed] + bypassList)
+        guard await applySystemProxy(endpoint: endpoint, bypassDomains: bypassList, services: activeServices) else {
+            await failStartAndRestore("系统代理写入或读回校验失败")
+            return
         }
-        log("系统代理已设置: \(proxyHost):\(externalProxy.port)", .success)
+        monitoredNetworkServices = activeServices
+        monitoredBypassDomains = bypassList
+        monitoredProxyEndpoint = endpoint
+        log("系统代理已设置并校验: \(externalProxy.host):\(externalProxy.port)", .success)
 
         // Write Chrome Managed Policy (forces proxy + bypass for all users)
         let chromeDomainBypassItems = companyDomains.flatMap { broadBypassItems(for: $0) }
@@ -2197,29 +3029,46 @@ final class ProxyService: ObservableObject {
 
         // Path 1: Chrome Managed Policy (user-level, Chrome 89+)
         let managedDir = "\(homeDir)/Library/Application Support/Google/Chrome/Managed"
-        try? FileManager.default.createDirectory(atPath: managedDir, withIntermediateDirectories: true, attributes: nil)
-        try? chromePolicyXML.write(toFile: "\(managedDir)/com.google.Chrome.plist", atomically: true, encoding: .utf8)
-
-        // Path 2: Legacy preferences (older Chrome versions)
-        _ = await CommandRunner.run("/usr/bin/defaults", [
-            "write", "\(homeDir)/Library/Preferences/com.google.Chrome.plist", "ProxySettings",
-            "-dict", "ProxyMode", "fixed_servers", "ProxyServer", "\(externalProxy.host):\(externalProxy.port)", "ProxyBypassList", bypassStr
-        ])
-        chromePolicyInstalled = true
+        do {
+            try FileManager.default.createDirectory(atPath: managedDir, withIntermediateDirectories: true, attributes: nil)
+            try chromePolicyXML.write(toFile: "\(managedDir)/com.google.Chrome.plist", atomically: true, encoding: .utf8)
+            let defaultsResult = await CommandRunner.run("/usr/bin/defaults", [
+                "write", "\(homeDir)/Library/Preferences/com.google.Chrome.plist", "ProxySettings",
+                "-dict", "ProxyMode", "fixed_servers", "ProxyServer", "\(externalProxy.host):\(externalProxy.port)", "ProxyBypassList", bypassStr
+            ])
+            guard defaultsResult.succeeded else { throw CocoaError(.fileWriteNoPermission) }
+            let verify = await CommandRunner.run("/usr/bin/defaults", [
+                "read", "\(homeDir)/Library/Preferences/com.google.Chrome.plist", "ProxySettings"
+            ])
+            guard verify.succeeded, verify.stdout.contains("\(externalProxy.host):\(externalProxy.port)") else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            chromePolicyInstalled = true
+        } catch {
+            chromePolicyInstalled = false
+            log("Chrome 策略写入或读回失败: \(error.localizedDescription)", .error)
+            await failStartAndRestore("Chrome 策略未生效")
+            return
+        }
         log("Chrome 策略已配置", .success)
         suggestBrowserAction("Chrome 策略已配置，建议手动重启 Chrome 后生效。")
         log("未自动重启 Chrome；如需让 Chrome 立即套用新策略，请手动重启 Chrome", .info)
 
         // Load launchd
         if FileManager.default.fileExists(atPath: plistPath) {
-            _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
-            let loadRes = await CommandRunner.run("/bin/launchctl", ["load", plistPath])
-            if loadRes.succeeded {
+            guard await stopLaunchdGuard(plistPath: plistPath, guardScript: guardScript) else {
+                await failStartAndRestore("旧网络守护无法停止")
+                return
+            }
+            var loadRes = await CommandRunner.run("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistPath])
+            if !loadRes.succeeded {
+                loadRes = await CommandRunner.run("/bin/launchctl", ["load", plistPath])
+            }
+            guardLoaded = await isLaunchdGuardLoaded()
+            if guardLoaded {
                 log("网络守护已启动（事件驱动，公司 VPN 清代理时 2 秒内恢复）", .success)
-                guardLoaded = true
             } else {
                 log("网络守护启动失败: \(loadRes.stderr.isEmpty ? "launchctl 未返回详细原因" : loadRes.stderr)", .warn)
-                guardLoaded = false
                 await failStartAndRestore("网络守护启动失败")
                 return
             }
@@ -2227,24 +3076,36 @@ final class ProxyService: ObservableObject {
 
 
         await refreshStatus()
-        if systemProxyEnabled && guardLoaded {
-            phase = .running
-            statusMessage = "运行中"
-            log("========== 启动完成 ==========", .success)
-        } else {
-            await failStartAndRestore(systemProxyEnabled ? "网络守护未加载" : "系统代理未生效")
+        guard systemProxyEnabled, systemProxyMatchesExternal, guardLoaded, externalProxyRunning, appEnvFixed, chromePolicyInstalled else {
+            await failStartAndRestore("配置写入后的状态校验失败")
             return
         }
 
-        if phase == .running {
-            await checkInternalNetwork()
-            await checkExternalNetwork()
+        await checkInternalNetwork()
+        await checkExternalNetwork()
+        guard internalResult.accessible, externalResult.accessible else {
+            let reason = internalResult.accessible ? "外网代理验证失败" : "公司内网验证失败"
+            await failStartAndRestore(reason)
+            return
         }
+
+        phase = .running
+        statusMessage = "运行中"
+        log("========== 启动完成：内网与代理外网均已验证 ==========", .success)
     }
 
     // MARK: - Stop
 
-    func stop() async {
+    @discardableResult
+    func stop() async -> Bool {
+        guard !stopInProgress else {
+            log("停止流程已在执行，本次忽略重复请求", .info)
+            return false
+        }
+        stopInProgress = true
+        defer { stopInProgress = false }
+        invalidateStatusRefreshes()
+
         phase = .stopping
         statusMessage = "停止中…"
         log("========== 开始停止 ==========")
@@ -2252,15 +3113,20 @@ final class ProxyService: ObservableObject {
         let plistPath = "\(homeDir)/Library/LaunchAgents/com.clash.proxyguard.plist"
         let guardScript = "\(homeDir)/.local/bin/clash-proxy-guard.sh"
 
-        // 1. Unload launchd guard
-        _ = await CommandRunner.run("/bin/launchctl", ["unload", plistPath])
-        guardLoaded = false
-        log("网络守护已停止", .success)
+        guard await stopLaunchdGuard(plistPath: plistPath, guardScript: guardScript) else {
+            startupFailureCleanupCompleted = false
+            phase = .error
+            statusMessage = "停止失败：守护仍在运行"
+            log("========== 停止未完成：为避免守护覆盖原配置，本次未执行还原 ==========", .error)
+            return false
+        }
 
+        var restoreSucceeded = true
         if startupFailureCleanupCompleted {
             log("启动失败时已自动还原/清理，本次跳过重复清理", .info)
         } else {
-            _ = await restoreOrCleanupManagedConfiguration(plistPath: plistPath, guardScript: guardScript)
+            let restoreResult = await restoreOrCleanupManagedConfiguration(plistPath: plistPath, guardScript: guardScript)
+            restoreSucceeded = restoreResult.succeeded
 
             if externalProxySupportsClashConfig || externalProxyPreference != .shadowrocket {
                 // Reload Clash config after restoring or removing merge config.
@@ -2268,21 +3134,39 @@ final class ProxyService: ObservableObject {
             }
         }
 
-        suggestBrowserAction("Chrome 策略已移除，建议手动重启 Chrome 清掉旧代理。")
-        log("未自动退出 Chrome；如 Chrome 仍沿用旧代理，请手动重启 Chrome", .info)
-
         await refreshStatus()
+        let guardStillStopped = await stopLaunchdGuard(plistPath: plistPath, guardScript: guardScript)
+        invalidateStatusRefreshes()
+        guard restoreSucceeded && guardStillStopped else {
+            startupFailureCleanupCompleted = false
+            phase = .error
+            statusMessage = guardStillStopped ? "停止未完成：还原校验失败" : "停止失败：守护仍在运行"
+            log("========== 停止未完成，可再次点击中止并还原重试 ==========", .error)
+            return false
+        }
+        guardLoaded = false
+
+        suggestBrowserAction("Chrome 配置已恢复，建议手动重启 Chrome 读取恢复后的设置。")
+        log("未自动退出 Chrome；如 Chrome 仍沿用旧设置，请手动重启 Chrome", .info)
+
         startupFailureCleanupCompleted = false
+        monitoredNetworkServices = []
+        monitoredBypassDomains = []
+        monitoredProxyEndpoint = nil
         phase = .idle
         statusMessage = "就绪"
-        log("========== 停止完成 ==========", .success)
+        log("========== 停止完成：守护已移除，还原已校验 ==========", .success)
+        return true
     }
 
     // MARK: - Retry
 
     func retry() async {
         log("========== 重试 ==========")
-        await stop()
+        guard await stop() else {
+            log("停止或还原未完成，已取消重新启动", .error)
+            return
+        }
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         await start()
     }
@@ -2290,21 +3174,70 @@ final class ProxyService: ObservableObject {
     // MARK: - Status Refresh
 
     func refreshStatus() async {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+
         async let proxyCheck = CommandRunner.runShell("scutil --proxy 2>/dev/null")
-        async let guardCheck = CommandRunner.run("/bin/launchctl", ["list", "com.clash.proxyguard"])
+        async let guardCheck = CommandRunner.run("/bin/launchctl", ["print", guardLaunchdService])
         async let vpnCheck = detectCompanyVPNClient()
         async let externalProxyCheck = detectExternalProxyClient()
         let (proxy, guardChk, vpn, externalProxy) = await (proxyCheck, guardCheck, vpnCheck, externalProxyCheck)
 
-        systemProxyEnabled = proxy.stdout.contains("HTTPEnable : 1")
-        if let range = proxy.stdout.range(of: "HTTPPort : ") {
-            let portStr = proxy.stdout[range.upperBound...].components(separatedBy: "\n").first?.trimmingCharacters(in: .whitespaces) ?? ""
-            if let p = Int(portStr) { clashPort = p }
+        let actualHTTPProxy = NetworkCompatibility.parseSystemHTTPProxy(proxy.stdout)
+        let actualHTTPSProxy = NetworkCompatibility.parseSystemHTTPSProxy(proxy.stdout)
+        let actualSOCKSProxy = NetworkCompatibility.parseSystemSOCKSProxy(proxy.stdout)
+        let expectedExternalEndpoint = LocalProxyEndpoint(host: externalProxy.host, port: externalProxy.port)
+        let systemProxyEnabledValue = actualHTTPProxy != nil || actualHTTPSProxy != nil || actualSOCKSProxy != nil
+        let systemProxyMatchesExternalValue = externalProxy.running
+            && actualHTTPProxy == expectedExternalEndpoint
+            && actualHTTPSProxy == expectedExternalEndpoint
+            && actualSOCKSProxy == expectedExternalEndpoint
+        let actualExceptions = Set(normalizedBypassDomains(NetworkCompatibility.systemProxyExceptions(proxy.stdout)))
+        let requiredExceptions = Set(normalizedBypassDomains(requiredCompanyBypassItems))
+        let systemProxyBypassValidValue = requiredExceptions.isSubset(of: actualExceptions)
+        let guardLoadedValue = guardChk.succeeded
+
+        let chromePlistPath = "\(homeDir)/Library/Preferences/com.google.Chrome.plist"
+        let chromePolicyInstalledValue: Bool
+        if FileManager.default.fileExists(atPath: chromePlistPath) {
+            let readRes = await CommandRunner.run("/usr/bin/defaults", ["read", chromePlistPath, "ProxySettings"])
+            chromePolicyInstalledValue = readRes.succeeded
+                && readRes.stdout.contains("\(externalProxy.host):\(externalProxy.port)")
+        } else {
+            chromePolicyInstalledValue = false
         }
-        if let range = proxy.stdout.range(of: "HTTPProxy : ") {
-            proxyHost = proxy.stdout[range.upperBound...].components(separatedBy: "\n").first?.trimmingCharacters(in: .whitespaces) ?? "127.0.0.1"
+
+        let codexEnvPath = "\(homeDir)/.codex/.env"
+        let appEnvFixedValue: Bool
+        if let content = try? String(contentsOfFile: codexEnvPath, encoding: .utf8) {
+            let expectedProxyURL = proxyURL(for: LocalProxyEndpoint(host: externalProxy.host, port: externalProxy.port))
+            appEnvFixedValue = content.contains("export HTTP_PROXY=\(expectedProxyURL)")
+                && companyDomains.compactMap(NetworkCompatibility.normalizedDomain).allSatisfy { content.contains($0) }
+                && content.contains("unset ALL_PROXY")
+                && content.contains("export no_proxy=")
+                && !content.contains("export no_proxy=$NO_PROXY")
+        } else {
+            appEnvFixedValue = false
         }
-        guardLoaded = guardChk.exitCode == 0
+
+        var persistedRuntime: ManagedRuntimeSnapshot?
+        if guardLoadedValue,
+           snapshotIsUsable(at: snapshotPath),
+           let snapshotData = try? Data(contentsOf: URL(fileURLWithPath: snapshotPath)),
+           let snapshot = try? JSONDecoder().decode(RestoreSnapshot.self, from: snapshotData) {
+            persistedRuntime = snapshot.managedRuntime
+        }
+
+        guard generation == refreshGeneration else { return }
+
+        systemProxyEnabled = systemProxyEnabledValue
+        systemProxyMatchesExternal = systemProxyMatchesExternalValue
+        systemProxyBypassValid = systemProxyBypassValidValue
+        if let actualSystemEndpoint = actualHTTPProxy ?? actualHTTPSProxy ?? actualSOCKSProxy {
+            clashPort = actualSystemEndpoint.port
+            proxyHost = actualSystemEndpoint.host
+        }
+        guardLoaded = guardLoadedValue
         clashRunning = externalProxy.running
         externalProxyName = externalProxy.displayName
         externalProxyDetail = externalProxy.detail
@@ -2313,27 +3246,50 @@ final class ProxyService: ObservableObject {
         vpnClientName = vpn.displayName
         vpnClientDetail = vpn.detail
         vpnClientRunning = vpn.running
+        chromePolicyInstalled = chromePolicyInstalledValue
+        appEnvFixed = appEnvFixedValue
 
-        let chromePlistPath = "\(homeDir)/Library/Preferences/com.google.Chrome.plist"
-        if FileManager.default.fileExists(atPath: chromePlistPath) {
-            let readRes = await CommandRunner.run("/usr/bin/defaults", ["read", chromePlistPath, "ProxySettings"])
-            chromePolicyInstalled = readRes.succeeded && !readRes.stdout.isEmpty
-        } else {
-            chromePolicyInstalled = false
+        if phase == .idle, let runtime = persistedRuntime {
+            monitoredNetworkServices = runtime.networkServices
+            monitoredBypassDomains = runtime.bypassDomains
+            monitoredProxyEndpoint = LocalProxyEndpoint(host: runtime.proxyHost, port: runtime.proxyPort)
+            phase = .running
+            log("已接管上次运行中的网络守护并恢复断线监控", .info)
         }
 
-        let codexEnvPath = "\(homeDir)/.codex/.env"
-        if let content = try? String(contentsOfFile: codexEnvPath, encoding: .utf8) {
-            appEnvFixed = content.contains("limayao.com")
-                && content.contains("197.19.0.0/16")
-                && content.contains("unset ALL_PROXY")
-                && content.contains("export no_proxy=")
-                && !content.contains("export no_proxy=$NO_PROXY")
-        } else {
-            appEnvFixed = false
-        }
+        if phase == .running {
+            var managedNetworkIsValid = await monitoredNetworkConfigurationIsValid()
+            guard generation == refreshGeneration, phase == .running else { return }
+            if !managedNetworkIsValid {
+                // The launchd guard may still be repairing a VPN-triggered change.
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                if generation == refreshGeneration, phase == .running {
+                    managedNetworkIsValid = await monitoredNetworkConfigurationIsValid()
+                }
+            }
+            guard generation == refreshGeneration, phase == .running else { return }
 
-        if phase == .running { statusMessage = "运行中" }
+            var interruption: String?
+            if !vpn.running { interruption = "公司 VPN 已断开" }
+            else if !externalProxy.running { interruption = "外网代理已断开" }
+            else if !systemProxyEnabledValue { interruption = "系统代理已失效" }
+            else if !systemProxyMatchesExternalValue { interruption = "系统代理端口已变化" }
+            else if !systemProxyBypassValidValue { interruption = "公司网络绕过配置已变化" }
+            else if !guardLoadedValue { interruption = "网络守护已停止" }
+            else if !managedNetworkIsValid { interruption = "活动网络的代理或绕过配置已变化" }
+            else if !appEnvFixedValue { interruption = "Codex 代理环境已变化" }
+            else if !chromePolicyInstalledValue { interruption = "Chrome 代理策略已变化" }
+
+            if let interruption {
+                log("\(interruption)，正在自动恢复启动前配置", .error)
+                await stop()
+                if phase == .idle {
+                    statusMessage = "连接中断，已恢复原配置"
+                }
+                return
+            }
+            statusMessage = "运行中"
+        }
     }
 
     private func detectClashRunning(port: Int) async -> Bool {
@@ -2357,54 +3313,67 @@ final class ProxyService: ObservableObject {
         return lsofCheck.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
     }
 
+    private func specificCompanyRouteInterface(for ip: String) async -> String? {
+        let shadowrocketStatus = await CommandRunner.run("/usr/sbin/scutil", ["--nc", "status", "Shadowrocket"])
+        let excludedInterfaces = Set(
+            [NetworkCompatibility.interfaceName(in: shadowrocketStatus.stdout)].compactMap { $0 }
+        )
+        async let routeCheck = CommandRunner.run("/sbin/route", ["-n", "get", ip])
+        async let routingTableCheck = CommandRunner.run("/usr/sbin/netstat", ["-rn", "-f", "inet"])
+        let (route, routingTable) = await (routeCheck, routingTableCheck)
+        guard route.succeeded, routingTable.succeeded else { return nil }
+        return NetworkCompatibility.specificVirtualRouteInterface(
+            for: ip,
+            routeOutput: route.stdout,
+            routingTableOutput: routingTable.stdout,
+            excluding: excludedInterfaces
+        )
+    }
+
+    private func companyRouteInterface() async -> String? {
+        let nameservers = await systemNameservers()
+        for domain in companyDomains.compactMap(NetworkCompatibility.normalizedDomain) {
+            for prefix in ["", "new-api", "api", "www", "portal", "vpn"] {
+                let host = prefix.isEmpty ? domain : "\(prefix).\(domain)"
+                guard let ip = await resolveRealIPv4(host, nameservers: nameservers) else { continue }
+                if let interface = await specificCompanyRouteInterface(for: ip) {
+                    return interface
+                }
+            }
+        }
+        return nil
+    }
+
     private func detectCompanyVPNClient() async -> VPNClientDetection {
         async let processCheck = CommandRunner.runShell(
-            "ps ax -o command= 2>/dev/null | grep -Ei 'OpenVPN Connect|OpenVPN|openvpn|openvpn3|ovpnagent|SASE|sase|GlobalProtect|Zscaler|Netskope|Cisco AnyConnect|AnyConnect' | grep -vi 'MergeSASE' | grep -v grep | head -5"
+            "ps ax -o command= 2>/dev/null | grep -Ei 'OpenVPN Connect|OpenVPN|openvpn|openvpn3|ovpnagent|SASE|sase|GlobalProtect|Zscaler|Netskope|Cisco AnyConnect|AnyConnect' | grep -vi 'MergeSASE' | grep -v grep | head -20"
         )
-        async let interfaceCheck = CommandRunner.runShell(
-            "ifconfig 2>/dev/null | awk '/^[a-z0-9]+:/{iface=$1; sub(\":\", \"\", iface)} /status: active|inet /{print iface}' | grep -E '^(utun|tun|tap|ppp|ipsec)' | sort -u | tr '\\n' ' '"
-        )
-        async let routeCheck = CommandRunner.runShell(
-            "netstat -rn -f inet 2>/dev/null | awk '$NF ~ /^(utun|tun|tap|ppp|ipsec)/ {print $NF}' | sort -u | tr '\\n' ' '"
-        )
-        let (process, interfaces, routes) = await (processCheck, interfaceCheck, routeCheck)
+        async let connectionCheck = CommandRunner.run("/usr/sbin/scutil", ["--nc", "list"])
+        let (process, connections) = await (processCheck, connectionCheck)
+        let connectedNames = NetworkCompatibility.connectedVPNNames(in: connections.stdout)
+        let lower = process.stdout.lowercased()
+        var detectedClients: [String] = []
+        if lower.contains("sase") { detectedClients.append("SASE") }
+        if lower.contains("openvpn") || lower.contains("ovpnagent") { detectedClients.append("OpenVPN Connect") }
+        if lower.contains("globalprotect") { detectedClients.append("GlobalProtect") }
+        if lower.contains("zscaler") { detectedClients.append("Zscaler") }
+        if lower.contains("netskope") { detectedClients.append("Netskope") }
+        if lower.contains("anyconnect") { detectedClients.append("Cisco AnyConnect") }
 
-        let processOutput = process.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = processOutput.lowercased()
-        let interfaceOutput = interfaces.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let routeOutput = routes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let vpnInterfaces = [interfaceOutput, routeOutput]
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-        var seenInterfaces = Set<String>()
-        let uniqueInterfaces = vpnInterfaces.filter { seenInterfaces.insert($0).inserted }
-        let hasVPNInterface = !uniqueInterfaces.isEmpty
-        let detail = uniqueInterfaces.isEmpty ? "未发现 VPN 虚拟网卡" : "接口 \(uniqueInterfaces.joined(separator: ", "))"
+        guard let routeInterface = await companyRouteInterface() else {
+            let client = connectedNames.first ?? detectedClients.first ?? "公司 VPN"
+            let detail = connectedNames.isEmpty && detectedClients.isEmpty ? "未检测到已连接的公司 VPN" : "客户端已打开，但未确认公司路由"
+            return VPNClientDetection(displayName: client, detail: detail, running: false)
+        }
 
-        if lower.contains("openvpn") || lower.contains("ovpnagent") {
-            return VPNClientDetection(displayName: "OpenVPN Connect", detail: detail, running: hasVPNInterface)
+        if let connectedName = connectedNames.first {
+            return VPNClientDetection(displayName: connectedName, detail: "公司路由 \(routeInterface)", running: true)
         }
-        if lower.contains("sase") {
-            return VPNClientDetection(displayName: "SASE", detail: detail, running: hasVPNInterface)
+        guard !detectedClients.isEmpty else {
+            return VPNClientDetection(displayName: "公司 VPN", detail: "发现 \(routeInterface)，但无法确认所属客户端", running: false)
         }
-        if lower.contains("globalprotect") {
-            return VPNClientDetection(displayName: "GlobalProtect", detail: detail, running: hasVPNInterface)
-        }
-        if lower.contains("zscaler") {
-            return VPNClientDetection(displayName: "Zscaler", detail: detail, running: hasVPNInterface)
-        }
-        if lower.contains("netskope") {
-            return VPNClientDetection(displayName: "Netskope", detail: detail, running: hasVPNInterface)
-        }
-        if lower.contains("anyconnect") {
-            return VPNClientDetection(displayName: "Cisco AnyConnect", detail: detail, running: hasVPNInterface)
-        }
-        if !uniqueInterfaces.isEmpty {
-            return VPNClientDetection(displayName: "公司 VPN", detail: detail, running: true)
-        }
-        return VPNClientDetection()
+        let displayName = detectedClients.count == 1 ? detectedClients[0] : "公司 VPN"
+        return VPNClientDetection(displayName: displayName, detail: "公司路由 \(routeInterface)", running: true)
     }
 
     // MARK: - Network Checks (detailed)
@@ -2469,15 +3438,7 @@ final class ProxyService: ObservableObject {
         log("检测外部网络: google.com（通过 \(proxyURL)）...")
         externalResult.url = "https://www.google.com"
 
-        var result = await externalCurl(proxyURL: proxyURL)
-        var usedProxy = true
-        if !externalCodeIsAccessible(result.code) {
-            let directResult = await externalCurl(proxyURL: nil)
-            if externalCodeIsAccessible(directResult.code) {
-                result = directResult
-                usedProxy = false
-            }
-        }
+        let result = await externalCurl(proxyURL: proxyURL)
 
         externalResult.statusCode = result.code
         externalResult.accessible = externalCodeIsAccessible(result.code)
@@ -2489,8 +3450,7 @@ final class ProxyService: ObservableObject {
         }
 
         if externalResult.accessible {
-            let mode = usedProxy ? "代理 \(proxyURL)" : "直接连接"
-            log("外部网络可访问: google.com → HTTP \(result.code) (\(externalResult.latencyMs)) 出口IP: \(result.remoteIP) [\(mode)] ✓", .success)
+            log("外部网络可访问: google.com → HTTP \(result.code) (\(externalResult.latencyMs)) 出口IP: \(result.remoteIP) [代理 \(proxyURL)] ✓", .success)
         } else {
             let errorDetail = result.stderr.isEmpty ? "" : "，错误: \(result.stderr)"
             log("外部网络不可访问: HTTP \(result.code) (\(externalResult.latencyMs))\(errorDetail)", .error)
@@ -2503,9 +3463,11 @@ final class ProxyService: ObservableObject {
     }
 
     func checkInternalNetwork() async {
-        guard let domain = companyDomains.first else {
+        guard let rawDomain = companyDomains.first,
+              let domain = NetworkCompatibility.normalizedDomain(rawDomain)
+        else {
             internalResult = NetworkCheckResult(accessible: false, url: "", ip: "", statusCode: "未配置", latencyMs: "")
-            log("公司内网未检测: 还没有配置公司域名", .warn)
+            log("公司内网未检测: 公司域名为空或格式不正确", .warn)
             return
         }
         log("检测公司内网: \(domain)...", .info)
@@ -2519,7 +3481,7 @@ final class ProxyService: ObservableObject {
         }
 
         let nameservers = await systemNameservers()
-        let digRaw = await CommandRunner.runShell("dig +short \(domain) 2>/dev/null")
+        let digRaw = await CommandRunner.run("/usr/bin/dig", ["+short", domain])
         let digClean = digRaw.stdout.components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.hasPrefix(";;") && !$0.isEmpty } ?? ""
@@ -2541,7 +3503,7 @@ final class ProxyService: ObservableObject {
             log("DNS 解析: \(domain) → \(internalResult.ip)", .info)
 
             // Route check for the resolved IP
-            let routeRes = await CommandRunner.runShell("route -n get \(internalResult.ip) 2>/dev/null | grep -E 'interface:|destination:'")
+            let routeRes = await CommandRunner.run("/sbin/route", ["-n", "get", internalResult.ip])
             if !routeRes.stdout.isEmpty {
                 log("路由信息: \(routeRes.stdout.replacingOccurrences(of: "\n", with: " | "))", .info)
             }
@@ -2556,7 +3518,7 @@ final class ProxyService: ObservableObject {
             }
 
             // Try full dig output to see what server responded
-            let digFull = await CommandRunner.runShell("dig \(domain) 2>/dev/null | grep -E 'SERVER:|status:|ANSWER SECTION' -A2")
+            let digFull = await CommandRunner.run("/usr/bin/dig", [domain])
             if !digFull.stdout.isEmpty {
                 log("dig 详情: \(digFull.stdout.replacingOccurrences(of: "\n", with: " | ").prefix(300))", .info)
             }
@@ -2580,9 +3542,14 @@ final class ProxyService: ObservableObject {
         var httpOK = false
 
         for scheme in ["https", "http"] {
-            let curlResult = await CommandRunner.runShell(
-                "curl -s -o /dev/null -w '%{http_code}|%{time_total}' --max-time 4 \(scheme)://\(checkURL) 2>&1"
-            )
+            let curlResult = await CommandRunner.run("/usr/bin/env", [
+                "-u", "ALL_PROXY", "-u", "all_proxy",
+                "-u", "HTTPS_PROXY", "-u", "https_proxy",
+                "-u", "HTTP_PROXY", "-u", "http_proxy",
+                "-u", "NO_PROXY", "-u", "no_proxy",
+                "/usr/bin/curl", "-s", "-o", "/dev/null", "-w", "%{http_code}|%{time_total}",
+                "--max-time", "4", "\(scheme)://\(checkURL)"
+            ])
             let parts = curlResult.stdout.components(separatedBy: "|")
             let code = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let latency = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
@@ -2603,14 +3570,9 @@ final class ProxyService: ObservableObject {
             // all good, HTTP check passed
         } else if !internalResult.ip.isEmpty {
             // DNS resolved — check route to verify internal path
-            let routeRes = await CommandRunner.runShell("route -n get \(internalResult.ip) 2>/dev/null | grep 'interface:'")
-            let routeIface = routeRes.stdout.replacingOccurrences(of: "interface:", with: "").trimmingCharacters(in: .whitespaces)
-            let isInternalRoute = routeIface.hasPrefix("utun")
-                || routeIface.hasPrefix("tun")
-                || routeIface.hasPrefix("tap")
-                || routeIface.hasPrefix("ppp")
+            let routeIface = await specificCompanyRouteInterface(for: internalResult.ip)
 
-            if isInternalRoute {
+            if let routeIface, vpnClientRunning {
                 internalResult.accessible = true
                 internalResult.statusCode = "-"
                 internalResult.latencyMs = "DNS ✓ 路由 \(routeIface)"
@@ -2619,7 +3581,7 @@ final class ProxyService: ObservableObject {
                 internalResult.accessible = false
                 internalResult.statusCode = "不可达"
                 internalResult.latencyMs = "路由异常"
-                log("公司内网不通: \(checkURL) → \(internalResult.ip)，路由接口: \(routeIface)（预期公司 VPN 的 utun/tun/tap 接口）", .error)
+                log("公司内网不通: \(checkURL) → \(internalResult.ip)（未确认公司 VPN 的专用路由，且服务无响应）", .error)
             }
         } else {
             internalResult.accessible = false

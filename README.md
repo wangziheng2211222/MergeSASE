@@ -15,13 +15,17 @@
 
 ## 快速开始
 
-### 终端安装
+兼容范围：macOS 13 或更高版本，支持 Intel 和 Apple Silicon。macOS 12 及更早版本不支持当前菜单栏界面。
+
+### 终端安装（2.1 正式发布后）
+
+当前 2.1 版本尚未上传 GitHub Release。发布完成后使用：
 
 ```bash
-curl -fL https://raw.githubusercontent.com/wangziheng2211222/MergeSASE/main/install.sh | VERSION=1.7 bash
+curl -fL https://raw.githubusercontent.com/wangziheng2211222/MergeSASE/2.1/install.sh | VERSION=2.1 bash
 ```
 
-脚本会下载最新发布包，安装到 `/Applications/蝉舒宝.app`，清除隔离属性并启动 App。
+脚本只会下载指定版本的 GitHub Release，校验版本、SHA-256、Universal 2 架构、签名和公证后，再安装到 `/Applications/蝉舒宝.app`。
 
 ### 从源码构建
 
@@ -36,8 +40,15 @@ open "蝉舒宝.app"
 
 ```bash
 cd MergeSASE
-PACKAGE=1 bash build.sh
+RELEASE_DIR="$(mktemp -d)"
+SIGN_IDENTITY="Developer ID Application: ..." \
+NOTARY_PROFILE="notary-profile" \
+EXPECTED_TEAM_ID="你的 Apple Team ID" \
+PACKAGE_PATH="$RELEASE_DIR/ChanShuBao.zip" \
+PACKAGE=1 RELEASE_VERSION=2.1 bash build.sh
 ```
+
+正式发布前，先把 `install.sh` 中的 `EXPECTED_TEAM_ID` 改成同一个 Apple Team ID。提交并推送 `2.1` 标签后，创建 GitHub Release，并同时上传 `ChanShuBao.zip` 与 `ChanShuBao.zip.sha256`。最后用上面的终端安装命令在未安装蝉舒宝的测试账户中验证一次。当前仓库根目录里的旧 ZIP 不作为 2.1 发布来源。
 
 ## 使用流程
 
@@ -47,7 +58,7 @@ PACKAGE=1 bash build.sh
 4. 点击“导入”，在 App 内置浏览器里登录 limayao 开发者后台。
 5. 登录完成后点击“导入当前页面”。成功后会唤起 CC Switch，并把 API Key 保存到本机用于余额查询。
 6. 配置公司域名，确保默认的 `cds8.cn`、`limayao.com` 或你的公司域名在列表中。
-7. 如果需要同时使用外网代理，点击“一键配置 Codex 环境”启动网络守护，让公司内网直连 VPN、外网走 Clash/Shadowrocket。
+7. 如果需要同时使用外网代理，建议使用 Clash Verge Rev 的系统代理模式；选择 Shadowrocket 时，需要确认其已连接并填写 Proxy Port。
 
 ## 隐私与凭据
 
@@ -58,23 +69,19 @@ PACKAGE=1 bash build.sh
 
 ## 网络说明
 
-公司 VPN（SASE、OpenVPN Connect、GlobalProtect、Zscaler、Netskope、Cisco AnyConnect 等）和外网代理（Clash/Shadowrocket）同时运行时，容易出现 DNS、TUN、系统代理和 Chrome 策略冲突。蝉舒宝会：
+公司 VPN（SASE、OpenVPN Connect、GlobalProtect、Zscaler、Netskope、Cisco AnyConnect 等）和外网代理同时运行时，容易出现 DNS、TUN、系统代理和 Chrome 策略冲突。正式推荐让公司 VPN 独占 TUN，Clash Verge Rev 只开启系统代理。Shadowrocket 的 PacketTunnel 与公司 VPN 共存属于兼容模式，最终以内网和代理外网实测为准。蝉舒宝会：
 
 - 为公司域名写入 Clash fake-ip/filter 和直连规则。
 - 为系统代理、Chrome 策略、launchd 环境变量写入绕过列表。
 - 在 `~/.codex/.env` 写入 HTTP(S)_PROXY 和 NO_PROXY，并清理 ALL_PROXY，避免公司内网请求被强制送入外网代理。
 - 停止时按启动前快照恢复系统代理、Chrome、Clash 和环境变量。
+- 只有确认公司 VPN、外网代理、活动物理网卡以及内外网实测全部通过后，才显示“运行中”；连接中断时自动恢复启动前配置。
 
 默认公司域名包含 `cds8.cn` 和 `limayao.com`，你可以在界面里增删自己的公司域名。
 
 ## 排查
 
-如果 macOS 提示应用损坏或无法打开：
-
-```bash
-xattr -cr "蝉舒宝.app"
-open "蝉舒宝.app"
-```
+如果 macOS 提示应用损坏或无法打开，不要清除隔离属性。请删除该文件，并从指定版本的 GitHub Release 重新下载安装；安装器会重新检查 SHA-256、应用身份、Developer ID 签名和 Gatekeeper 公证结果。
 
 如果导入失败：
 

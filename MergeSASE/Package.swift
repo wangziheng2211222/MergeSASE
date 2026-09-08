@@ -9,6 +9,11 @@ let package = Package(
             name: "MergeSASE",
             path: "Sources",
             swiftSettings: [.enableUpcomingFeature("BareSlashRegexLiterals")]
+        ),
+        .testTarget(
+            name: "MergeSASETests",
+            dependencies: ["MergeSASE"],
+            path: "Tests"
         )
     ]
 )
